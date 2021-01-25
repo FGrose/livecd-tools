@@ -378,6 +378,11 @@ class LiveImageCreatorBase(LoopImageCreator):
                            self.__isodir + "/LiveOS/squashfs.img",
                            self.compress_args, ops)
                 self._LoopImageCreator__instloop.cleanup()
+                if self.docleanup:
+                    if os_image == self._instroot:
+                        os.remove(self._image)
+                    else:
+                        os.remove(os.path.join(os_image, 'LiveOS', 'rootfs.img'))
 
             self.__create_iso(self.__isodir)
         finally:
