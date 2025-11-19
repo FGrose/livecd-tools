@@ -1590,8 +1590,9 @@ class LiveImageMount(object):
             return
         if not ops:
             ops = self.ops
-        for f in ('syslinux/syslinux.cfg', 'syslinux/extlinux.conf',
-                  '../EFI/BOOT/grub.cfg', '../EFI/boot/grub.cfg'):
+        for f in ('boot/grub2/grub.cfg',
+                  '../EFI/BOOT/grub.cfg', '../EFI/boot/grub.cfg',
+                  'syslinux/syslinux.cfg', 'syslinux/extlinux.conf'):
             cfgf = os.path.join(self.srcdir, f)
             if os.path.exists(cfgf):
                 break
