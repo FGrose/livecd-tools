@@ -32,5 +32,7 @@ class CryptoLUKSError(CreatorError):
     pass
 class SquashfsError(CreatorError):
     pass
+class ErofsError(CreatorError):
+    pass
 class ResizeError(CreatorError):
     pass

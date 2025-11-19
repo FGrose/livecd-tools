@@ -128,6 +128,34 @@ def mksquashfs(in_dir, out_img, compress_args, ops=[]):
         raise SquashfsError("'%s' exited with error (%d)" %
                             (' '.join(args), ret))
 
+def mkerofs(in_dir, out_img, compress_args='lzma,level=6', ops=[]):
+
+    args = ['mkfs.erofs']
+    if compress_args is None:
+        compress_args = 'lzma,level=6'
+    args += ['-z' + compress_args]
+
+    args += ['-Efragments', '-C1048576', '-L', 'EROFS']
+
+    if 'show-squashing' in ops:
+        ops.remove('show-squashing')
+    ops.remove('EROFS')
+    if ops:
+        args += ops
+
+    args += [out_img, in_dir]
+
+    if '--quiet' not in ops:
+        p = subprocess.Popen(args, stdout=None, stderr=subprocess.STDOUT)
+        p.wait()
+        ret = p.returncode
+    else:
+        ret = call(args)
+
+    if ret != 0:
+        raise ErofsError("'%s' exited with error (%d)" %
+                            (' '.join(args), ret))
+
 def checkfsblksz(fstype, size, use=None, fssize=None):
 
     if fstype in ('fat', 'vfat', 'msdos'):
