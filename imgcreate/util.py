@@ -67,5 +67,5 @@ def rcall(args, stdin='', raise_err=True, cwd=None, env=None):
             raise CreatorError('Error in call:\n%s\nenviron: %s\n'
                                 'stdout: %s\nstderr: %s\nreturncode: %s' %
                                (args, environ, out, err, p.returncode))
-    finally:
-        return out.decode('utf-8'), err.decode('utf-8'), p.returncode
+
+    return out.decode('utf-8'), err.decode('utf-8'), p.returncode

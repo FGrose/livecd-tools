@@ -359,8 +359,8 @@ def get_blockdev(major_minor):
                            '/dev', 'block', major_minor)))))
     except OSError:
         dev = None
-    finally:
-        return dev
+
+    return dev
 
 def get_blockdev_size(device):
     """Return the device size in bytes."""
