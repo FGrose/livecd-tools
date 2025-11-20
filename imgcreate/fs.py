@@ -1078,7 +1078,7 @@ class BindChrootMount():
         self.mounted = True
 
     def remount(self, ops):
-        if not self.mounted or not os.path.ismount(self.dest):
+        if not self.mounted:
             self.mounted = False
             return
 
@@ -1090,7 +1090,7 @@ class BindChrootMount():
                              (remount_ops, self.src, self.dest))
 
     def unmount(self):
-        if not self.mounted or not os.path.ismount(self.dest):
+        if not os.path.ismount(self.dest):
             self.mounted = False
             return
 
