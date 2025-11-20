@@ -316,7 +316,7 @@ def main():
             creator._do_bindmounts()
             print("Launching shell. Exit (Ctrl D) to continue.")
             print("-------------------------------------------")
-            creator.launch_shell(PS1='[\\u@\\H:install_root\\w:]\\n\\$ ')
+            creator.launch_shell(prompt=r'[\u@\H:install_root\w:]\n\$ ')
             os.system('umount -R ' + creator._instroot + '/dev')
             creator._ImageCreator__destroy_selinuxfs()
             imgcreate.ImageCreator._undo_bindmounts(creator)

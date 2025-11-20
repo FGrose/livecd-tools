@@ -830,7 +830,7 @@ class ImageCreator(object):
         finally:
             self._do_bindmounts()
 
-    def launch_shell(self, PS1='\\s-\\v\\$ '):
+    def launch_shell(self, prompt=r'\s-\v\$ '):
         """Launch a shell in the install root.
 
         This method is launches a bash shell chroot()ed in the install root;
@@ -838,7 +838,7 @@ class ImageCreator(object):
 
         """
         env = os.environ.copy()
-        env['PS1'] = PS1
+        env['PS1'] = prompt
 
         subprocess.call("bash", preexec_fn=self._chroot, env=env)
 

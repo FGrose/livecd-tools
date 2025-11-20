@@ -578,6 +578,17 @@ class LiveImageEditor(LiveImageCreator):
         finally:
             os.unlink(path)
 
+    def launch_shell(self, prompt=r'\s-\v\$ '):
+        """Launch a shell in the install root.
+
+        This method is launches a bash shell chroot()ed in the install root;
+        this can be useful for debugging.
+
+        """
+        env = os.environ.copy()
+        env['PS1'] = prompt
+
+        subprocess.call("bash", preexec_fn=self._chroot, env=env)
 
     def _pre_mount(self, base_on, rootfsimg=None, overlay=None):
         """Prepare for mounting the existing filesystem.
@@ -1578,7 +1589,7 @@ class LiveImageEditor(LiveImageCreator):
             elif s == 's' and 'current' in msg:
                 self.shell = True
             elif s == 's':
-                self.launch_shell(PS1='[\\u@\\H:install_root\\w:]\\n\\$ ')
+                self.launch_shell(prompt=r'[\u@\H:install_root\w:]\n\$ ')
                 self.check_kernel_versions(isodir, msg)
 
 
@@ -2781,7 +2792,7 @@ def main():
             print('''Launching shell. Exit (Ctrl D) to continue.
                   \r-------------------------------------------''')
             ops = None
-            editor.launch_shell(PS1='[\\u@\\H:install_root\\w:]\\n\\$ ')
+            editor.launch_shell(prompt=r'[\u@\H:install_root\w:]\n\$ ')
 
         editor.kernels = None
         editor.bootpath = os.path.join(isodir, editor._imgdir)
