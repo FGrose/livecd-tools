@@ -510,7 +510,7 @@ class ImageCreator(object):
         # if the system was running selinux clean up our lies
         path = self._instroot + self.__selinux_mountpoint + "/load"
         if os.path.exists(path):
-            arglist = ["umount", path]
+            arglist = ["umount", '-l', path]
             subprocess.call(arglist, close_fds = True)
 
     def mount(self, base_on = None, cachedir = None):
