@@ -192,17 +192,37 @@ B<WARNING:>  User sensitive information such as password cookies and application
 
 This option will reset the persistent overlay to an unallocated state.  This might be used if installing a new or refreshed image onto a device with an existing overlay, and avoids the writing of a large file on a vfat-formatted device.  This option also renames the overlay to match the current device filesystem label and UUID.
 
+=item --unsquashfs|skipcompress [sizegb,][fstype[,blksz[,extra_attr,s]]]
+
+(default on --xo) Expand the source SquashFS image using unsquashfs into a new filesystem image file with optional filesystem size in gibibytes, filesytem type (ext[234]|xfs|btrfs|f2fs), blocksize, and extra_attr,s for f2fs. The expanded root filesystem image file, F</LiveOS/rootfs.img>, will be a read-only base for a Device-mapper or OverlayFS overlay unless the --no-overlay option is also provided (see below).  The filesystem size will be the embedded rootfs.img filesystem size for traditional F<squashfs.img> files, but directly squashed or flattened F<squashfs.img> files will default to a size 8 times the compressed size if sizegb is not provided. An expanded filesystem avoids the overhead of file decompression on use, but incurs the expense of extra storage space and bus I/O.
+
+=item --flat-sqfsimg
+
+Compress or recompress the source root filesystem to yield a directly squashed, or 'flattened', root filesystem image suitable for OverlayFS overlays only.  (Uses the command C<mksquashfs .. .. -comp zstd -b 1M -one-file-system -no-recovery -noappend -not-reproducible>.
+
+=item --embedded-fsimg|compress [sizegb,][fstype[,blksz[,extra_attr,s]]]
+
+Save the root filesystem as an embedded image file of size and type all zstd compressed within a SquashFS.  (Native Fedora .iso files have this structure, but use the xz compression algorithm.)
+
+=item --no-overlay      (Effective only with C<--unsquashfs|rfspartition> or an uncompressed image.)
+
+Installs a kernel option, C<rd.live.overlay=none>, that signals the live boot process to create a writable, linear Device-mapper target for an uncompressed F<rootfs.img> image file. Read-write by default (unless a kernel argument of C<rd.live.overlay.readonly> is given) this configuration avoids the complications of using an DM overlay of fixed size for persistence when storage format and space allows.
+        
+If the writable, root filesystem is on a block device partition, and F<<livedir>/rootfs.img> is a symbolic link to it, as the C<--rfspartition> option invokes, it will be mounted directly as the root filesystem. This standard filesystem root mount installation is suitable when storage capacity and disk I/O speed are sufficient.
+
+=item --clone
+
+Directs the script to copy and compress the currently running root filesystem (F</afs /bin /boot /etc /home /lib /lib64 /media /mnt /opt /root /sbin /srv /usr /var /.liveimg-configured /.liveimg-late-configured>) into a new flattened F<squashfs.img> file using C<mksquashfs>.  If the currently running system is not a LiveOS image, a <source> LiveOS must be provided as a template for boot configurations for the new installation.  The result is a LiveOS clone of the non-LiveOS image
+
+B<NOTE WELL:> this includes user sensitive information from /home).  If the currently running system is a LiveOS image, this process merges the readonly rootfsbase with any overlay into a new, flattened-squashfs image.  If cloning a running LiveOS, the new image will be stored at F</<livedir>/_squashfs.img> (space permitting), and if requested, the boot configuration files will be adjusted to use the new base image on the next boot.
+
+=item --builder
+
+Names the user who builds a cloned image.  Default is $USERNAME.
+
 =item --compress    (default state for the original root filesystem)
 
 The default, compressed SquashFS filesystem image is copied on installation.  (This option has no effect if the source filesystem is already expanded.)
-
-=item --skipcompress    (default option when  --xo is specified)
-
-Expands the source F<squashfs.img> on installation into the read-only F</LiveOS/rootfs.img> root filesystem image file.  This avoids the system overhead of decompression during use at the expense of storage space and bus I/O.
-
-=item --no-overlay    (effective only with --skipcompress or an uncompressed image)
-
-Installs a kernel option, C<rd.live.overlay=none>, that signals the live boot process to create a writable, linear Device-mapper target for an uncompressed F</LiveOS/rootfs.img> filesystem image file.  Read-write by default (unless a kernel argument of C<rd.live.overlay.readonly> is given) this configuration avoids the complications of using an overlay of fixed size for persistence when storage format and space allows.
 
 =item --home-size-mb <size>[,fstype[,blksz]]
 

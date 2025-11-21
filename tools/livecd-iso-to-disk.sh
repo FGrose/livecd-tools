@@ -1,7 +1,7 @@
-#!/bin/bash
+#!/bin/bash -x
 # Transfer a Live image so that it's bootable off of a USB/SD device.
 # Copyright 2007-2012, 2017, Red Hat, Inc.
-# Copyright 2008-2010, 2017-2021, Fedora Project
+# Copyright 2008-2010, 2017-2025, Fedora Project
 #
 # Jeremy Katz <katzj@redhat.com>
 # Brian C. Lane <bcl@redhat.com>
@@ -24,26 +24,29 @@
 
 
 export PATH=/sbin:/usr/sbin:$PATH
+export PS4='+ ($BASH_SOURCE@$LINENO) ${FUNCNAME:+$FUNCNAME()}: '
 trap error_report ERR
 
 shortusage() {
     echo "
     SYNTAX
 
-    livecd-iso-to-disk [--format [<size>[,fstype[,blksz[,extra_attr,s]]]]]
-                       [--msdos] [--efi] [--noesp] [--nomac] [--reset-mbr]
-                       [--multi] [--livedir <directory>] [--skipcopy]
+    livecd-iso-to-disk [--format [sizemb,][fstype[,blksz[,extra_attr,s]]]]
+                       [--msdos] [--efi] [--noesp] [--reset-mbr] [--multi] 
+                       [--rfspartition [sizegb[,fstype[,blksz[,extra_attr,s]]]]]
+                       [--livedir <directory>] [--skipcopy|--reconfig]
                        [--noverify] [--force] [--xo] [--xo-no-home]
                        [--timeout <duration>] [--totaltimeout <duration>]
                        [--nobootmsg] [--nomenu] [--extra-kernel-args <arg s>]
-                       [--overlay-size-mb <size>[,fstype[,blksz]]]
+                       [--overlay-size-mb size[,fstype[,blksz]]]
                        [--overlayfs [temp]] [--copy-overlay] [--reset-overlay]
-                       [--compress] [--skipcompress] [--no-overlay]
-                       [--home-size-mb <size>[,fstype,blksz]]] [--copy-home]
+                       [--unsquashfs [sizegb[,fstype[,blksz[,extra_attr,s]]]]]
+                       [--flat-sqfsimg] [--no-overlay] [--clone] [--builder]
+                       [--home-size-mb size[,fstype,blksz]]] [--copy-home]
                        [--delete-home] [--crypted-home] [--unencrypted-home]
-                       [--swap-size-mb <size>] [--updates <updates.img>]
+                       [--swap-size-mb size] [--updates <updates.img>]
                        [--ks <kickstart>] [--label <label>] [--help]
-                       <source> <target partition/device>
+                       <source> <target partition/device/directory>
 
     (Enter livecd-iso-to-disk --help on the command line for more information.)"
 }
@@ -66,7 +69,7 @@ usage() {
                  'live' for the <source> will source the currently booted
                  LiveOS device.
 
-             <target partition/device>
+             <target partition/device/directory>
                  This should be, or a link to, the device partition path for
                  an attached, target device, such as /dev/sdc1.  A virtual
                  block device, such as a loop device or a Device-mapper target
@@ -77,7 +80,8 @@ usage() {
                  another disk!  If you request formatting with the --format
                  option, enter only the base device path, such as /dev/sdc.
                  For a multi boot installation to the currently booted
-                 device, enter 'live' as the target.
+                 device, enter 'live' as the target, or the live directory of
+                 of a mounted device to run the --reconfig|--skipcopy option.
 
     To execute the script to completion, you will need to run it with root user
     permissions.  Legacy booting of the installed image requires that SYSLINUX
@@ -156,10 +160,10 @@ usage() {
 
     OPTIONS
 
-    --format [sizemb[,fstype[,blksz[,extra_attr,s]]]]
+    --format [sizemb,][fstype[,blksz[,extra_attr,s]]]
         Partitions and formats the target device, creates an MS-DOS partition
         table or GUID partition table (GPT), if the --efi option is passed,
-        creates 1 to 3 partitions, and invokes the --reset-mbr action.
+        creates 1 to 2 partitions, and invokes the --reset-mbr action.
 
         NOTE WELL: All current disk content will be lost.
 
@@ -171,11 +175,8 @@ usage() {
             loader, such as the one from dracut triggered by the above format
             request.)  Partition 1 is labelled as before or requested,
             flagged as bootable, and may allow an optional block size.
-          Partition 2 is fat16 formatted and labelled 'EFI System Partition'.
-          Partition 3 is HFS+ formatted and labelled as 'Mac'.
-
-            Creation of partitions 2 & 3 is dependent on the presence of the
-            files /images/efiboot.img & /images/macboot.img in the source.
+          Partition 2 is fat16 formatted, labelled 'EFI System Partition', and
+            contains the content of the /EFI directory branch.
 
     --msdos (a legacy option. Use the --format msdos syntax instead.)
         Forces format to use the msdos (vfat) filesystem instead of ext4.
@@ -184,21 +185,27 @@ usage() {
         NOTE: Even without this option, EFI components are always configured
               and loaded on the target disk if they are present on the source.
         When --efi is used with --format, a GUID partition table (GPT) and 1 to
-          3 partitions are created.  A hybrid Extensible Firmware Interface
+          2 partitions are created.  A hybrid Extensible Firmware Interface
           (EFI)/MBR bootloader is installed on the disk.
           This option is necessary for most Intel Macs.
         When --efi is used without --format but with --reset-mbr,
           it loads a hybrid (EFI)/MBR bootloader on the device.
 
      --noesp    (Used with --format)
-        Skips the formatting of a secondary EFI System Partition and
-          an Apple HFS+ boot partition.
+        Skips the formatting of the EFI System Partition.
         NOTE: Even with this option, EFI components are configured and loaded
               on the primary partition if they are present on the source.
 
-     --nomac    (Used with --format)
-        Skips the formatting of an Apple HFS+ boot partition.  Useful when
-        hfsplus-tools are not available.
+    --rfspartition [sizegb,][fstype[,blksz[,extra_attr,s]]]
+        Format a partition to hold either a flattened SquashFS for use with an
+        OverlayFS overlay or an expanded LiveOS source filesystem for direct
+        mounting.  Provide squashfs as fstype for a flattened SquashFS
+        partition.  This avoids any loop devices in the root filesystem.  Add
+        the --overlayfs option for persistence with this configuration.
+
+        For an uncompressed, writable filesystem partition, specify ext[234]|
+        xfs|btrfs|f2fs as fstype with optional filesystem size in gibibytes,
+        blocksize, and extra_attr,s for f2fs. Also specify --no-overlay.
 
    --reset-mbr|--resetmbr
         Sets the Master Boot Record (MBR) of the target storage device to the
@@ -212,8 +219,8 @@ usage() {
         target device.  Image and boot files will be installed under the
         --livedir <directory>.  SYSLINUX boot components from the installation
         host will always update those in the boot path of the target device.
-        Boot files in the /EFI directories will be replaced by files from the
-        source if they have newer modified times.
+        Boot files in the /EFI & /boot directories will be replaced by files
+        from the source if they have newer modification times.
 
     --livedir <directory>
         Designates the directory for installing the LiveOS image.  The default
@@ -235,12 +242,12 @@ usage() {
         target storage device.
 
     --force
-        This option forces an overwrite of the --livedir image, its syslinux
-        directory, and associated files like home.img.  This allows the script
-        to bypass a delete confirmation dialog in the event that a pre-existing
-        LiveOS directory is found on the target device.  It also skips writing
-        a new boot entry in the current system's UEFI boot manager for F2FS
-        formatted target devices.
+        This option bypasses confirmation dialogs for formatting the device or
+        overwriting of --livedir image, its syslinux directory, and associated
+        files like home.img in the event that a pre-existing LiveOS directory
+        is found on the target device.  It also skips writing a new boot entry
+        in the current system's UEFI boot manager for F2FS formatted target
+        devices.
 
     --xo
         Used to prepare an image for the OLPC XO-1 laptop with its compressed,
@@ -351,26 +358,67 @@ usage() {
         vfat-formatted device.  This option also renames the overlay to match
         the current device filesystem label and UUID.
 
-    --compress   (default state for the original root filesystem)
-        The default, compressed SquashFS filesystem image is copied on
-        installation.  (This option has no effect if the source filesystem is
-        already expanded.)
+    --unsquashfs|skipcompress [sizegb,][fstype[,blksz[,extra_attr,s]]]
+            (default on --xo)
+        Expand the source SquashFS image using unsquashfs into a new filesystem
+        image file with optional filesystem size in gibibytes, filesytem type
+        (ext[234]|xfs|btrfs|f2fs), blocksize, and extra_attr,s for f2fs. The
+        expanded root filesystem image file, /LiveOS/rootfs.img, will be a
+        read-only base for a Device-mapper or OverlayFS overlay unless the
+        --no-overlay option is also provided (see below).  The filesystem size
+        will be the embedded rootfs.img filesystem size for traditional
+        squashfs.img files, but directly squashed or flattened squashfs.img
+        files will default to a size 8 times the compressed size if sizegb is
+        not provided.
+        An expanded filesystem avoids the overhead of file decompression on use,
+        but incurs the expense of extra storage space and bus I/O.
 
-    --skipcompress   (default option when  --xo is specified)
-        Expands the source SquashFS.img on installation into the read-only
-        /LiveOS/rootfs.img root filesystem image file.  This avoids the system
-        overhead of decompression during use at the expense of storage space
-        and bus I/O.
+    --flat-sqfsimg
+        Compress or recompress the source root filesystem to yield a directly
+        squashed, or 'flattened', root filesystem image suitable for OverlayFS
+        overlays only.  (Uses the command 'mksquashfs .. .. -comp zstd -b 1M
+        -one-file-system -no-recovery -noappend -not-reproducible'.
 
-    --no-overlay   (effective only with skipcompress or an uncompressed image)
+    --embedded-fsimg|compress [sizegb,][fstype[,blksz[,extra_attr,s]]]
+        Save the root filesystem as an embedded image file of size and type all
+        zstd compressed within a SquashFS.  (Native Fedora .iso files have this
+        structure, but use the xz compression algorithm.)
+
+    --no-overlay   (effective only with --unsquashfs|rfspartition or an
+                    uncompressed image)
         Installs a kernel option, rd.live.overlay=none, that signals the live
-        boot process to create a writable, linear Device-mapper target for an
-        uncompressed /LiveOS/rootfs.img filesystem image file.  Read-write by
-        default (unless a kernel argument of rd.live.overlay.readonly is given)
-        this configuration avoids the complications of using an overlay of
-        fixed size for persistence when storage format and space allows.
+        boot process to create a writable, linear Device-mapper target
+        for an uncompressed rootfs.img image file. Read-write by default
+        (unless a kernel argument of rd.live.overlay.readonly is given) this
+        configuration avoids the complications of using an DM overlay of fixed
+        size for persistence when storage format and space allows.
+        
+        If the writable, root filesystem is on a block device partition, and
+        <livedir>/rootfs.img is a symbolic link to it, as the --rfspartition
+        option invokes, it will be mounted directly as the root filesystem.
+        This standard filesystem root mount installation is suitable when
+        storage capacity and disk I/O speed are sufficient.
 
-    --home-size-mb <size>[,fstype[,blksz]]
+    --clone
+        Directs the script to copy and compress the currently running root
+        filesystem (/afs /bin /boot /etc /home /lib /lib64 /media /mnt /opt
+        /root /sbin /srv /usr /var /.liveimg-configured /.liveimg-late-configured)
+        into a new flattened squashfs.img file using mksquashfs.  If the
+        currently running system is not a LiveOS image, a <source> LiveOS must
+        be provided as a template for boot configurations for the new
+        installation.  The result is a LiveOS clone of the non-LiveOS image
+        (NOTE WELL: this includes user sensitive information from /home).  If
+        the currently running system is a LiveOS image, this process merges the
+        readonly rootfsbase with any overlay into a new, flattened-squashfs
+        image.  If cloning a running LiveOS, the new image will be stored at
+        /<livedir>/_squashfs.img (space permitting), and if requested, the boot
+        configuration files will be adjusted to use the new base image on the
+        next boot.
+
+    --builder
+        Names the user who builds a cloned image.  Default is $USERNAME.
+
+    --home-size-mb size[,fstype[,blksz]]
         Specifies creation of a home filesystem of <size> mebibytes (integer
         values only).  A persistent home directory will be stored in the
         /LiveOS/home.img filesystem image file.  This filesystem is encrypted
@@ -445,7 +493,7 @@ usage() {
 
     COPYRIGHT
 
-    Copyright 2008-2010, 2017-2021, Fedora Project and various contributors.
+    Copyright 2008-2010, 2017-2025, Fedora Project and various contributors.
     This is free software. You may redistribute copies of it under the terms of
     the GNU General Public License https://www.gnu.org/licenses/gpl.html.
     There is NO WARRANTY, to the extent permitted by law.
@@ -457,6 +505,8 @@ usage() {
     exit 1
 }
 
+printf "${*:0}
+"
 if [[ ${*:0} =~ -help|\ -h|-\? ]]; then
     usage
 fi
@@ -497,54 +547,80 @@ checkForSyslinux() {
 }
 
 fscheck() {
-    local fstype=$1
-    local fs=$2
-    case $fstype in
+    local fstype="$1"
+    local fs="$2"
+    local dev="${3:-$2}"
+    local cmd
+    umount "$fs" >/dev/null 2>&1 || :
+    case "$fstype" in
         ext[432])
-            e2fsck -yfv $fs || :
+            printf '\n'
+            flock "$dev" e2fsck -yfv "$fs" || :
             ;;
         vfat|msdos)
-            fsck.fat -avVw $fs
+            printf '\n'
+            flock "$dev" fsck.fat -avVw "$fs"
             ;;
         btrfs)
-            btrfs check -p --repair --force $fs
+            cmd='btrfs check -p --repair --force'
+            printf "# $cmd"
+            flock "$dev" $cmd "$fs"
             ;;
         xfs)
-            xfs_repair -v $fs
-            ;;
-        hfsplus)
-            fsck.hfsplus -yfp $fs
+            cmd='xfs_repair -v'
+            printf "\n# $cmd"
+            flock "$dev" $cmd "$fs"
             ;;
         f2fs)
-            fsck.f2fs -f $fs
+            cmd='fsck.f2fs -afy'
+            printf "# $cmd"
+            flock "$dev" $cmd "$fs"
+            ;;
+        *)
+            printf "\n\tERROR:   Filesystem checking for '%s' is not\n \
+                available.\n" "$fstype"
     esac
 }
 
 cleansrc() {
-    umount $IMGMNT $IMGMNT &> /dev/null || :
-    rmdir $IMGMNT &> /dev/null || :
+    umount /usr/lib/modules >/dev/null 2>&1 || :
+    [[ $RFSwasMounted ]] || { umount $IMGMNT $IMGMNT >/dev/null 2>&1 || :
+        rmdir $IMGMNT >/dev/null 2>&1 || :
+        }
 }
 
 cleanup() {
-    sync -f $TGTMNT/$LIVEOS/ &> /dev/null || :
-    losetup -d $l2 $l3 &> /dev/null || :
-    if [[ -d $SRCMNT && -z $SRCwasMounted ]]; then
+    [[ -f $TGTMNT/$LIVEOS/ ]] && sync -f $TGTMNT/$LIVEOS/ \
+        >/dev/null 2>&1 || :
+#    losetup -d $l2 >/dev/null 2>&1 || :
+    if [[ -d $SRCMNT && ! $SRCwasMounted ]]; then
         umount $SRCMNT && rmdir $SRCMNT
     fi
-    umount $TGTMNT &> /dev/null || :
-    for p in $(findmnt -nro TARGET -S $TGTDEV || :); do
-        umount -l $p
+    if [[ -d $TGTDIR ]]; then
+        umount -d $TGTDIR >/dev/null 2>&1 || :
+        rmdir $TGTDIR
+    fi
+    umount $TGTMNT >/dev/null 2>&1 || :
+    for ppath in $(findmnt -nro TARGET -S $TGTPT || :); do
+        [[ $ppath != /run/initramfs/live ]] && umount -l $ppath
+    done
+    for mp in ${mp[@]}; do
+        umount $mp >/dev/null 2>&1 && rmdir $mp
     done
     [[ -d $TGTMNT ]] && rmdir $TGTMNT
-    if [[ -d $d ]] && mountpoint -q $d; then
-        umount $d && rmdir $d
+    if [[ -d $ESPMNT ]] && mountpoint -q $ESPMNT; then
+        [[ $RFSwasMounted ]] || { umount $ESPMNT && rmdir $ESPMNT ;}
     fi
     sleep 2
-    if [[ -z $1 ]]; then
-        fscheck $TGTFS $TGTDEV || :
+    if [[ ! $1 ]] && ! findmnt -nro TARGET $TGTPT >/dev/null 2>&1; then
+        fscheck $TGTFS $TGTPT $device || :
     fi
+#    if [[ -b $rfs_p && $rfspartition != squashfs && ! $1 ]] &&
+#        ! findmnt -nro TARGET $rfs_p >/dev/null 2>&1; then
+#        fscheck ${rfs_v[1]} $rfs_p $device || :
+#    fi
     if [[ $(lsblk -ndo TYPE $device) == dm ]]; then
-        dmsetup -v remove ${p3##*/} ${p2##*/}
+        dmsetup -v remove ${esp##*/}
     fi
 }
 
@@ -559,16 +635,102 @@ exitclean() {
     exit $RETVAL
 }
 
+fsinput() {
+    local inp=$1
+    local -n var=$inp
+    declare -ag "$1"'=({'"$2"'})'
+    i=${#var[@]}
+    local r='{[1-9]*([0-9])}'
+    case $var in
+        $r)
+            i=0
+            unset -v 's'
+            ;&
+        {?*})
+            var=${var//[{\}]/}
+    esac
+    unset -v 's'
+    if [[ $i == 1 ]]; then         # size or fstype alone
+#        var=($inp $var)
+        r='--+([a-z])+([-a-z])*'
+        case $inp in
+            format|unsqfs|mksqfs)
+                case ${var[0]} in
+                    --msdos)
+                        var[1]=msdos
+                        ;&
+                    fat|vfat|msdos|ext[234]|xfs|btrfs|f2fs)
+                        var[1]=${var[0]}; var[0]='' # $inp
+                        s=2
+                        ;;
+                    [./]*|live|$r)                  # next parameter or option
+                        var[1]=ext4                 # default fstype
+                        s=1
+                        var[0]=''        # ''
+                esac
+                [[ $1 == @(format|unsqfs) ]] && checkfstype ${var[1]} $inp || :
+                ;;
+            overlaysizeb|homesizeb)
+                printf '
+                ERROR:  < %s > is not a valid integer value for %s.
+                \n' ${var[1]} --${inp/sizeb/-size-gb}
+                exit 1
+                ;;
+            clone)
+                case ${var[1]} in
+                    [./]*|live|$r)                  # next parameter or option
+                        var[1]=all                  # default directories
+                        s=1
+                        ;;
+                    --msdos)
+                        var[1]=msdos
+                        ;&
+                    fat|vfat|msdos|ext[234]|xfs|btrfs|f2fs)
+                        s=2
+                        ;;
+                esac
+        esac
+    fi
+}
+
+fsinput2() {
+    local inp=$1
+    local -n var=$inp
+#    if [[ $i == [1-9] ]]; then
+        [[ $var == [[:alpha:]]* ]] && var=('' "${var[@]}")
+#    fi
+    checkfstype ${var[1]:=ext4} $inp
+    if [[ $var ]]; then
+        checkinput $var $inp
+        case $inp in
+            format|homesizeb|overlaysizeb)
+                ((var<<=20)) ;;
+            unsqfs|mksqfs)
+                ((var<<=30))
+        esac
+        case ${var[1]} in
+            xfs) ((var < 16<<20)) && { printf "
+                 ERROR:  < %s > is below the minimum size for an
+                         'xfs' filesystem.\n
+                 " $var
+                 exit 1 ;}
+        esac
+    fi
+    if [[ ${var[2]} ]]; then
+        checkinput ${var[2]} blocksize ${var[1]} $inp
+    fi
+}
+
 checkinput() {
     local val=$1
-    local measure=$2
+    local inp=$2
     local fstype=$3
     local use=$4
-    case $measure in
+    local n='[1-9]*([0-9])'
+    case $inp in
         format)
-            local re='[1-9]*([0-9])'
             case $val in
-                $re)
+                $n)
                     if (($val < 512)); then
                         echo -e "
                         NOTE: '$val MiB' may be small for an image partition."
@@ -584,15 +746,27 @@ checkinput() {
                     exit 1
             esac
             ;;
+        unsqfs)
+            case $val in
+                $n)
+                    return 0
+                    ;;
+                *)
+                    echo -e "
+                    ERROR: '$val' is not a valid integer entry for rootfs size
+                                  in GiB.\n"
+                    exit 1
+            esac
+            ;;
         timeout)
-            if [[ $val != @(0|-0|-1|[1-9]*([0-9])) ]]; then
+            if [[ $val != @(0|-0|-1|$n) ]]; then
                 shortusage
                 echo -e "\nERROR: '$1' is not a valid integer for --$2.\n"
                 exit 1
             fi
             ;;
         totaltimeout)
-            if [[ $val != @(0|[1-9]*([0-9])) ]]; then
+            if [[ $val != @(0|$n) ]]; then
                 shortusage
                 echo -e "\nERROR: '$1' is not a valid integer for --$2.\n"
                 exit 1
@@ -611,20 +785,11 @@ checkinput() {
                         ' $1
                         exit 1
                     fi
-                    if [[ $use == dev ]] && ((val > 512)); then
+                    if [[ $use == format ]] && ((val > 512)); then
                         printf '
                         WARNING:
                         Block sizes greater that 512 bytes on vfat partitions
                         are not suitable for SYSLINUX bootable partitions.
-                        Press Ctrl C to abort or Enter to continue...\n'
-                        read
-                    fi
-                    if [[ $use == home ]]; then
-                        printf '
-                        WARNING:
-                        Using a FAT filesystem for a GNU/Linux home directory
-                        will cause many core applications and services to fail
-                        do to its limitations in managing access rights.
                         Press Ctrl C to abort or Enter to continue...\n'
                         read
                     fi
@@ -645,7 +810,7 @@ checkinput() {
                         exit 1
                     fi
                     local s=$(LC_ALL=C getconf PAGESIZE)
-                    if [[ $use == dev ]] && ((val > s)); then
+                    if [[ $use == format ]] && ((val > s)); then
                         printf '
                         WARNING:
                         Partitions with block sizes greater than the
@@ -656,15 +821,7 @@ checkinput() {
                     fi
                     ;;
                 btrfs)
-                    local -n var
-                    case $use in
-                        ovl)
-                            var=overlaysizeb ;;
-                        home)
-                            var=homesizeb ;;
-                        dev)
-                            var=format
-                    esac
+                    local -n var=$inp
                     if (( var < 16<<30)); then
                         if [[ $val != 4 ]]; then
                         printf '
@@ -693,7 +850,7 @@ checkinput() {
             esac
             ;;
         *)
-            if [[ $val != [1-9]*([0-9]) ]]; then
+            if [[ $val != $n ]]; then
                 shortusage
                 echo -e "\nERROR: '$1' is not a valid integer for $2.\n"
                 exit 1
@@ -701,44 +858,47 @@ checkinput() {
     esac
 }
 
+fserr() {
+    printf '
+    ERROR:  < %s > is not a supported filesystem type for the %s.\n
+    Supported filesystems are %s.\n
+    Please adjust this option.  Exiting...\n\n' $1 "$2" "$3"
+    exit 1
+    }
+
+fsmaf() {
+    # Set filesystem metadata allowance factor.
+    local fstype=$1
+    case $fstype in
+        ext[432])
+            m=5 ;;       # 1>>5 = 1/32
+        xfs)
+            m=6 ;;       # 1>>6 = 1/64
+        fat|vfat|msdos)
+            m=9 ;;       # 1>>9 = 1/512
+        btrfs)
+            m=10 ;;     # 1>>10 = 1/1024
+        f2fs)
+            m=4          # 1>>4 = 1/16
+    esac
+}
+
 checkfstype() {
     local fstype=$1
-    local fs=$2
-    fserr() {
+    local inp=$2
+    local r='ext[432]|btrfs|xfs|f2fs'
+    if [[ $fstype == f2fs ]] && ! type mkfs.f2fs >/dev/null 2>&1; then
         printf '
-                ERROR:  < %s > is not a supported filesystem type.\n
-                Supported filesystems are %sext[432], btrfs, xfs, & f2fs.\n
-                Please adjust this option.  Exiting...\n\n' $1 "$2"
-                exit 1
-        }
-    case $fstype in
-        f2fs)
-            if ! type mkfs.f2fs >/dev/null 2>&1; then
-                printf '
-                NOTICE:  f2fs-tools must be installed in the host operating
-                system in order to create F2FS filesystems.\n
-                Run the command "sudo dnf install f2fs-tools".  Exiting...\n\n'
-                exit 1
-            fi
-    esac
-    case $fs in
-        dev)
-            # Set filesystem metadata allowance factor.
+        NOTICE:  f2fs-tools must be installed in the host operating
+        system in order to create or configure F2FS filesystems.\n
+        Run the command "sudo dnf install f2fs-tools".  Exiting...\n\n'
+        exit 1
+    fi
+    case $inp in
+        format|unsqfs)
+            fsmaf $fstype
             case $fstype in
-            ext[432])
-                m=5       # 1>>5 = 1/32
-                ;;
-            xfs)
-                m=6       # 1>>6 = 1/64
-                ;;
-            fat|vfat|msdos)
-                m=9       # 1>>9 = 1/512
-                ;;
-            btrfs)
-                m=10     # 1>>10 = 1/1024
-                ;;
             f2fs)
-                m=4       # 1>>4 = 1/16
                 if [[ ${format[*]:3} =~ extra_attr ]] &&
                     ! type objcopy >/dev/null 2>&1; then
                     printf '
@@ -753,18 +913,22 @@ checkfstype() {
                     nouefi=nouefi
                 fi
                 ;;
+            ext[432]|btrfs|xfs|fat|vfat|msdos) : ;;
             *)
-                fserr $fstype 'fat|vfat|msdos, '
-        esac
-            ;;
-        ovl)
-            if [[ $fstype == !(ext[432]|btrfs|xfs|f2fs) ]]; then
-                fserr $fstype ''
-            fi
-            ;;
-        home)
-            if [[ $fstype == !(fat|vfat|msdos|ext[432]|btrfs|xfs|f2fs) ]]; then
-                fserr $fstype 'fat|vfat|msdos, '
+                case $inp in
+                format) s='main device' ;;
+                *) s='expanded root filesystem'
+                esac
+                fserr $fstype "$s" 'fat|vfat|msdos|'$r
+            esac
+            ;;&
+        unsqfs|mksqfs)
+            inp='root filesystem'
+            r+='|squashfs'
+            ;&
+        overlaysizeb|homesizeb)
+            if [[ $fstype == !($r) ]]; then
+                fserr $fstype "${inp%sizeb} filesystem" $r
             fi
     esac
 }
@@ -782,22 +946,40 @@ nocase_path() {
 }
 
 run_parted() {
-    LC_ALL=C parted "$@"
+    LC_ALL=C flock $1 parted --script "$@"
 }
 
 getdisk() {
     local dev=$1
-
-    p=$(udevadm info -q path -n $(readlink -nf $dev))
-    if [[ -d /sys/$p/loop ]] || [[ -d /sys/$p/device ]] ||
-       [[ -d /sys/$p/dm ]]; then
-        device=${p##*/}
-    else
-        local d=$(readlink -nf /sys/$p/../)
-        device=${d##*/}
+    if [[ -d $dev ]]; then
+        if ! [[ $skipcopy ]] && [[ ! $multi ]]; then
+            printf "
+            \r   Notice:  A directory target is designed to be used with the
+            --reconfig option for reconfiguration of a particular 'LiveOS'
+            installation on a Multi Live image device.  The directory target
+            should be the --livedir directory.
+            Please check your inputs.
+            Exiting...\n"
+            exitclean
+        fi
+        if ! [[ -d $dev/images || -d $dev/../images || -d $dev/../syslinux ||
+            -d $dev/syslinux || -e $dev/squashfs.img || -e $dev/rootfs.img ||
+            -f $dev/ext3fs.img ]]; then
+            printf "\n        ALERT:
+            The directory, '%s' does not seem to be a 'LiveOS' installation.
+            Please check your inputs.
+            Exiting...\n" $dev
+            exitclean
+        fi
+        # LIVEOS=${dev##*/}
+        [[ -d $dev/images || -d $dev/syslinux ]] && multi=$LIVEOS
+        TGTPT=$(findmnt -nro SOURCE --target $dev)
+        dev=$TGTPT
     fi
+    local pname=($(lsblk -nrdpo PKNAME,KNAME $dev))
+    device=${pname[0]}
     if [[ $device =~ loop ]] &&
-        ! [[ $'\n'$(lsblk -nro NAME /dev/loop[0-9]
+        ! [[ $'\n'$(lsblk -nrpo NAME /dev/loop[0-9]
                     )$'\n' =~ $'\n'${device}$'\n' ]]; then
         printf "\n        ALERT:
         The loop device, '%s' is not attached or available.\n
@@ -805,43 +987,52 @@ getdisk() {
         Exiting...\n" $dev
         exitclean
     fi
-    if [[ -z $device || ! -d /sys/block/$device || ! -b /dev/$device ]]; then
+    if [[ ! $device || ! -b $device ]]; then
         echo -e "\n>>>  Error finding block device of '$dev'.  Aborting!\n"
         exitclean
     fi
 
-    device=/dev/$device
-    local d=/dev/${p##*/}
-    partnum=${d##$device}
+    partnum=${dev##$device}
     # Strip off leading p from partnum, e.g., with /dev/mmcblk0p1
     partnum=${partnum##p}
     ! [[ $partnum ]] && partnum=1
-    p2=$(get_partition_name $device $((partnum+1)))
-    p3=$(get_partition_name $device $((partnum+2)))
+    dev=($(lsblk -nrdbo SIZE,OPT-IO $device))
+    tds=${dev[0]}
+    oio=${dev[1]}
+    ((oio <= 512)) && ((oio=1<<22))
+    z=$((tds%oio))
+    # Assure at least 2 MiB free space at the end of the disk.
+    ((z < 2<<20)) && ((z+=oio))
+    :
 }
 
-get_partition_name() {
-    # Return an appropriate name for partition $2. Devices that end with a
-    # digit need to have a 'p' prepended to the partition number.
+aptPartitionName() {
+    # Return an appropriate name for device $1 partition [$2]. Device names
+    # that end with a digit must have a 'p' prepended to the partition number.
     local dev=$1
-    local pn=$2
+    local partNbr=${2:-1}
+    ((partNbr<1)) && partNbr=1
 
-    if [[ $dev =~ .*dm-[0-9]+$ ]]; then
-        dev=/dev/mapper/$(< /sys$p/dm/name)
-    fi
-    if [[ $dev =~ .*[0-9]+$ ]]; then
-        echo -n "${dev}p$pn"
-    else
-        echo -n "${dev}$pn"
-    fi
+    case "${dev}~" in
+        *dm-[0-9]~)
+            local ppath=/devices/virtual/block/${dev##*/}
+            dev=/dev/mapper/$(cat /sys"$ppath"/dm/name)
+    esac
+    case "${dev}~" in
+        *[0-9]~)
+            echo -n "${dev}p$partNbr"
+            ;;
+        *)
+            echo -n "${dev}$partNbr"
+    esac
 }
 
 partSize() {
-    echo $(lsblk -nbdo size $1)
+    echo $(lsblk -nbdo SIZE $1)
 }
 
 resetMBR() {
-    udevadm settle
+    udevadm trigger --settle --name-match=$device
     if [[ $syslinuxboot == missing ]]; then
         printf '\n        NOTICE:
         The Master Boot Record (MBR) will not be reset because
@@ -851,7 +1042,7 @@ resetMBR() {
         such as GRUB, and the target system firmware.\n'
 
     # If gpt, we need to use the hybrid MBR.
-    elif [[ gpt == $(lsblk -ndro PTTYPE $device) ]]; then
+    elif [[ gpt == $PTTYPE ]]; then
         if [[ -f /usr/lib/syslinux/gptmbr.bin ]]; then
             cat /usr/lib/syslinux/gptmbr.bin > $device
         elif [[ -f /usr/share/syslinux/gptmbr.bin ]]; then
@@ -862,7 +1053,7 @@ resetMBR() {
         fi
         if [[ $resetmbr ]]; then
             # Make the partition bootable from BIOS.
-            run_parted --script $device set $partnum legacy_boot on
+            run_parted $device set $partnum legacy_boot on
         fi
     else
         if [[ -f /usr/lib/syslinux/mbr.bin ]]; then
@@ -875,10 +1066,106 @@ resetMBR() {
         fi
     fi
     # Wait for changes to show up/settle down.
-    udevadm settle
+    udevadm trigger --settle --name-match=$device
 }
 
-checkMBR() {
+checkPartitioning() {
+    udevadm trigger --settle --name-match=$device
+    IFS=$'\n'
+    local PT=($(run_parted $device unit B -m print))
+    local P=${PT[-1]}
+    partNbr=${P%%:*}          # last_partition_num
+    IFS=:
+    P=(${PT[1]})
+    IFS=$' \t\n'
+    PTTYPE=${P[5]}
+    end=${P[1]%B}
+
+    if [[ ! ${format[1]} ]] || [[ $skipcopy ]]; then
+        [[ ${format[1]}$skipcopy ]] || ((partNbr+=1))    # last_partition + 1
+        if [[ $rfspartition ]]; then
+            rfs_p=$(realpath $TGTMNT/$LIVEOS/rootfs.img)
+#            rfs_p=$(aptPartitionName $device $partNbr)
+            ((end%oio > 0)) && ((end=(end/oio+1)*oio))
+            if (( partNbr > 3 )); then
+                IFS=$'\n'
+                P=($(run_parted $device unit B -m print free))
+                P=${P[-1]}
+                IFS=:
+                P=($P)
+                IFS=$' \t\n'
+                FreeSpace=${P[3]%B}
+                end=${P[1]%B}
+                ((end%oio > 0)) && ((end=(end/oio+1)*oio))
+            fi
+        fi
+        case $PTTYPE in
+        msdos)
+            esp=$(lsblk -nrpo PARTTYPE,FSTYPE,LABEL,UUID,NAME $device)
+            esp=${esp#*0xef vfat * * } ;;
+        gpt)
+            esp=$(lsblk -nrpo PARTTYPE,PARTLABEL,FSTYPE,LABEL,UUID,PATH $device)
+#            esp=${esp[@]#*c12a7328-f81f-11d2-ba4b-00a0c93ec93b EFI\\x20System\\x20Partition vfat ESP * };
+            esp=${esp#*c12a7328-f81f-11d2-ba4b-00a0c93ec93b * vfat * * }
+        esac
+        esp=${esp%%$'\n'*}
+        [[ -b $esp ]] || unset -v 'esp'
+    fi
+    [[ $GRUBonly ]] && return 0
+
+    if [[ $efi ]] || [[ $PTTYPE == gpt ]]; then
+        if ! [[ $PTTYPE == gpt ]]; then
+            printf '\n        ATTENTION:
+        EFI booting often requires a GPT partition table on the boot disk.\n
+        This can be set up manually, or you can reformat your disk
+        by running livecd-iso-to-disk with the --format --efi options.\n
+        Sometimes, when EFI components are available in a legacy MBT partition
+        with a fat filesystem, booting with the GRUB menu is possible. When
+        EFI components are available in the source disk, they will be
+        configured and loaded onto the target device. To test if they will work
+        without a GPT partition table, remove the --efi option from the
+        livecd-iso-to-disk command line, and see if a UEFI menu item
+        appears in the BIOS boot menu.\n'
+            exitclean
+        fi
+        if ! [[ ${PT[((partnum+1))]} =~ :boot,\ .*legacy_boot,\ esp\; ]]; then
+            if ! run_parted $device set 1 boot on set 1 legacy_boot on set 1 esp on ; then
+                printf "\n        ATTENTION:
+                The partition isn't marked as an EFI System bootable.\n
+                Mark the partition as bootable with the following commands:\n
+                # parted %s
+         (parted) set %s boot on
+         (parted) set %s legacy_boot on
+         (parted) set %s esp on
+         (parted) quit\n\n" $device $partnum $partnum $partnum
+                exitclean
+            fi
+        fi
+    else
+        # Because we can't set boot flag for EFI Protective on msdos partition tables.
+
+        # If we're installing to whole-disk and not a partition, then we
+        # don't need to worry about being active.
+        if [[ ! $format ]] && [[ 0x80 != $(lsblk -nro PARTFLAGS $TGTPT) ]]; then
+            printf '\n        NOTICE:
+            The partition is not marked bootable.\n
+            Attempting to set the boot flag now...\n'
+            run_parted $device set $partnum boot on
+            udevadm trigger --settle --name-match=$device
+            if [[ 0x80 == $(lsblk -nro PARTFLAGS $TGTPT) ]]; then
+                printf "\n        Success!  '$TGTPT' is now a bootable partition.\n"
+            else
+                printf "\n        > Failed. <\n
+                Check your device partition scheme.
+                You may be able to mark the partition bootable
+                with the following commands:\n
+                # parted %s
+         (parted) toggle %s boot
+         (parted) quit\n\n" $device $partnum
+                exitclean
+            fi
+        fi
+    fi
     local mbrword=($(hexdump -n 2 <<< \
         "$(dd if=$device bs=2 count=1 &> /dev/null)")) || exit 2
     if [[ ${mbrword[1]} == 0000 ]]; then
@@ -889,36 +1176,9 @@ checkMBR() {
         read
         resetMBR
     fi
+
+    [[ $resetmbr ]] && resetMBR
     return 0
-}
-
-checkPartActive() {
-    local dev=$1
-
-    # If we're installing to whole-disk and not a partition, then we
-    # don't need to worry about being active.
-    if [[ -n $format ]]; then
-        return
-    fi
-    if [[ 0x80 != $(lsblk -nro PARTFLAGS $dev) ]]; then
-        printf '\n        NOTICE:
-        The partition is not marked bootable.\n
-        Attempting to set the boot flag now...\n'
-        run_parted --script $device set $partnum boot on
-        udevadm settle
-        if [[ 0x80 == $(lsblk -nro PARTFLAGS $dev) ]]; then
-            printf "\n        Success!  '$dev' is now a bootable partition.\n"
-        else
-            printf "\n        > Failed. <\n
-            Check your device partition scheme.
-            You may be able to mark the partition bootable
-            with the following commands:\n
-            # parted %s
-     (parted) toggle %s boot
-     (parted) quit\n\n" $device $partnum
-            exitclean
-        fi
-    fi
 }
 
 mkfs_config() {
@@ -928,17 +1188,21 @@ mkfs_config() {
     local fn=$4
     local fstype=${var[1]:=ext4}
     local bs=${var[2]}
-    local xa=${format[*]:3}
+    local xa="${var[*]:3}"
     local sz=$var
     ops=''
-    loop=''
+#    fsloop=''
     case $fstype in
         fat|vfat|msdos)
             # mkfs.fat silently truncates label to 11 bytes.
             _label="${lbl[*]::11}"
             ops=-v\ -n\ "$_label"
-            [[ -n $bs ]] && ops+=' -S '$bs
-            [[ -n $fn ]] && ops+=" -C $fn "$((sz/1024))
+            [[ $bs ]] && ops+=' -S '$bs
+            if [[ -b $fn ]]; then
+                ops+=' '$fn
+            elif [[ $fn ]]; then
+                ops+=" -C $fn "$((sz>>10))
+            fi
             if [[ $fs == dev ]]; then
                 f=fat32
                 [[ $bs != @(''|512) ]] && syslinuxboot=''
@@ -954,9 +1218,11 @@ mkfs_config() {
             # mkfs.ext[432] maximum label length is 16 bytes.
             _label="${lbl[*]::16}"
             ops+="-F -L $_label"
-            [[ -n $bs ]] && ops+=' -vb '$bs
-            if [[ -n $fn ]]; then
-                falloc $sz "$fn"
+            [[ $bs ]] && ops+=' -vb '$bs
+            if [[ -b $fn ]]; then
+                ops+=' '$fn
+            elif [[ $fn ]]; then
+                falloc $sz "$fn" $fs
                 ops+=" -E nodiscard $fn"
             fi
             ;;
@@ -964,12 +1230,14 @@ mkfs_config() {
             # mkfs.xfs maximum label length is 12 characters.
             _label="${lbl[*]::12}"
             ops="-f -L $_label"
-            if [[ -n $bs ]]; then
+            if [[ $bs ]]; then
                 ops+=' -b 'size=$bs
                 ((bs<1024)) && ops+=' -m 'crc=0
             fi
-            if [[ -n $fn ]]; then
-                falloc $sz "$fn"
+            if [[ -b $fn ]]; then
+                ops+=' -l internal '$fn
+            elif [[ $fn ]]; then
+                falloc $sz "$fn" $fs
                 ops+=" -K -l internal -d file=0,name=$fn"
             fi
             ;;
@@ -979,13 +1247,15 @@ mkfs_config() {
             ops="-f -L $_label"
             # Recommended by Btrfs wiki for out of space problems.
             # https://btrfs.wiki.kernel.org/index.php/FAQ#if_your_device_is_small
-            [[ -n $sz ]] && ((sz < 16<<30)) && ops+=\ --mixed
-            [[ $fs == @(home|ovl) ]] && [[ -n $bs ]] && ops+=' -n '${bs}k
-            if [[ -n $fn ]]; then
-                falloc $sz "$fn"
+            [[ $sz ]] && ((sz < 16<<30)) && ops+=\ --mixed
+            [[ $fs == @(home|ovl|partition) ]] && [[ $bs ]] && ops+=' -n '${bs}k
+            if [[ -b $fn ]]; then
+                ops+=' '$fn
+            elif [[ $fn ]]; then
+                falloc $sz "$fn" $fs
                 [[ $fs == ovl ]] && [[ $TGTFS == btrfs ]] && chattr +C "$fn"
-                loop=$(losetup -f --show "$fn")
-                ops+=' --nodiscard '$loop
+                fsloop=$(losetup -f --show "$fn")
+                ops+=' --nodiscard '$fsloop
             fi
             ;;
         f2fs)
@@ -1000,143 +1270,138 @@ mkfs_config() {
                         extra_attr or compression.\n
                 Press Ctrl C to abort, or Enter to continue...\n\n"
                 read
-                unset -v xa
+                unset -v 'xa'
             fi
             [[ $xa ]] && ops+=" -O ${xa// /,}"
-            [[ $fs == dev ]] && f=''
-            if [[ -n $fn ]]; then
-                falloc $sz "$fn"
-                loop=$(losetup -f --show "$fn")
-                ops+=' -t 0 '$loop
+#            [[ $fs == dev ]] && f=''  # f=fstype for parted
+            if [[ -b $fn ]]; then
+                ops+=' '$fn
+            elif [[ $fn ]]; then
+                falloc $sz "$fn" $fs
+                fsloop=$(losetup -f --show "$fn")
+                ops+=' -t 0 '$fsloop
             fi
     esac
     [[ $fs != dev ]] && mkfs=mkfs.$fstype || :
 }
 
 createFSLayout() {
-    local partition_label_type=msdos
+    local PTTYPE=msdos
     local pt=primary
-    local pn=''
+    local pname=''
     f=$TGTFS
-    local boot='set 1 boot on'
-    if [[ -z $noesp ]]; then
+    local boot
+    [[ $GRUBonly ]] || boot='set 1 boot on'
+    if [[ ! $noesp ]] || [[ $rfspartition ]]; then
         # Allow 1 MiB gap.
         ((format-=1<<20))
     else
-        boot+=' set 1 esp on'
+        [[ $GRUBonly ]] || boot+=' set 1 esp on'
     fi
-    local end=$((oio+format))
-    if [[ -n $efi ]]; then
-        partition_label_type=gpt
+    end=$((oio+format))
+    if [[ $efi ]]; then
+        PTTYPE=gpt
         pt=''
-        pn="${label:=LIVE}"
-        boot+=' set 1 legacy_boot on'
+        pname="${label:=LIVE}"
+        [[ $GRUBonly ]] || boot+=' set 1 legacy_boot on'
     fi
 
     mkfs_config dev "${label:=LIVE}" format
-    run_parted --script $device mklabel $partition_label_type
-    run_parted --script $device unit B mkpart $pt $pn $f $oio $end $boot
-    echo -e '\nWaiting for devices to settle...'
-    TGTDEV=$(get_partition_name $device '1')
-    udevadm settle -E $TGTDEV
-    umount $TGTDEV &> /dev/null || :
-    $mkfs $ops $TGTDEV
-    echo
-    udevadm settle -E /dev/disk/by-label/"$_label"
-    label=$(lsblk -ndo LABEL $TGTDEV)
+    run_parted $device mklabel $PTTYPE \
+                                unit B mkpart ${pt:+$pt} $partNbr $f $oio $end $boot
+#    echo -e '\nWaiting for devices to settle...'
+    TGTPT=$(aptPartitionName $device '1')
+    udevadm trigger  --settle --name-match=$device
+#   read
+    umount $TGTPT &> /dev/null || :
+    flock $device $mkfs $ops $TGTPT
+#    echo
+#    udevadm settle # -E /dev/disk/by-label/"$_label"
+#    label=$(lsblk -ndo LABEL $TGTPT)
 
-    ((end+=1<<20))
-    if [[ -n $l2 ]]; then
-        if [[ $partition_label_type == gpt ]]; then
-            pn='"EFI System Partition"'
+    ((end+=1<<20)) # Back to oio alignment
+    unset -v 'partNbr'
+    if [[ $esps ]]; then
+        esp=$(aptPartitionName $device 2)
+        if [[ $PTTYPE == gpt ]]; then
+            pname='"EFI System Partition"'
         fi
         boot='set 2 esp on'
-        run_parted --script $device unit B mkpart $pt "$pn" fat32 \
-                     $end $((end+p2s-(1<<20))) $boot
-        echo 'Waiting for devices to settle...'
-        p2=$(get_partition_name $device '2')
-        udevadm settle -E $p2
-        mkfs.fat -v -n ESP $p2
-        umount $p2 &> /dev/null || :
-        losetup -d $l2 &> /dev/null || :
-        fsck.fat -avVw $p2
-        echo
+        run_parted $device unit B mkpart $pt fat32 \
+                                         $end $((end+esps-(1<<20))) $boot
+        echo -e '\nWaiting for devices to settle...\n'
+        udevadm trigger --action=add --settle $device
+        flock $device mkfs.fat -v -n ESP $esp
+        ESPMNT=$(mktemp -d /tmp/espmnt.XXXXXX)
+        mount $esp $ESPMNT
+        cp -a $SRCMNT/$srcdir/../EFI $ESPMNT >/dev/null 2>&1 || :
+        umount $esp >/dev/null 2>&1 || :
+        [[ $ESPMNT ]] && rmdir $ESPMNT   #   || losetup -d $l2
+        flock $device fsck.fat -avVw $esp
+        partNbr=3
+        #((partNbr+=1))
+        ((end+=esps))
     fi
-
-    if [[ -n $l3 ]]; then
-        [[ $partition_label_type == gpt ]] && pn='"Mac"'
-        ((end+=p2s))
-        run_parted --script $device unit B mkpart $pt "$pn" hfs+ \
-                     $end $((end+p3s))
-        p3=$(get_partition_name $device '3')
-        mkfs.hfsplus $p3 -v Apple
-        f=$(mktemp -d)
-        udevadm settle -E $p3
-        mount $p3 $f
-        d=$(mktemp -d)
-        mount -t hfsplus $l3 $d >/dev/null 2>&1
-        cp -Trp $d $f
-        umount $d $f >/dev/null 2>&1 || :
-        losetup -d $l3
-        rmdir $f $d
-        if ! fsck.hfsplus -yrdfp $p3 ; then
-            printf '\n        NOTICE:
-            The macboot.img failed the filesystem check after copying.
-            Macintosh booting will fail.\n
-                    Press Enter to continue, or Ctrl C to abort.'
-            unset -v p3
-            read
-        fi
+    if [[ $rfspartition ]]; then
+        partitionrfs
     fi
 }
 
-checkGPT() {
-
-    local partinfo=$(run_parted --script -m $device 'print')
-    if ! [[ ${partinfo} =~ :gpt: ]]; then
-        printf '\n        ATTENTION:
-        EFI booting often requires a GPT partition table on the boot disk.\n
-        This can be set up manually, or you can reformat your disk
-        by running livecd-iso-to-disk with the --format --efi options.\n
-        Sometimes, when EFI components are available in a legacy MBT partition
-        with a fat filesystem, booting with the GRUB menu is possible. When
-        EFI components are available in the source disk, they will be
-        configured and loaded onto the target device. To test if they will work
-        without a GPT partition table, remove the --efi option from the
-        livecd-iso-to-disk command line, and see if a UEFI menu item
-        appears in the BIOS boot menu.'
-        exitclean
-    fi
-
-    partinfo=${partinfo#*$partnum:}
-    if ! [[ $partinfo =~ :boot,\ .*legacy_boot,\ esp\; ]]; then
-        printf "\n        ATTENTION:
-        The partition isn't marked as an EFI System bootable.\n
-        Mark the partition as bootable with the following commands:\n
-        # parted %s
- (parted) set %s boot on
- (parted) set %s legacy_boot on
- (parted) set %s esp on
- (parted) quit\n\n" $device $partnum $partnum $partnum
-        exitclean
-    fi
+partitionrfs () {
+    local pname
+    local pt
+    local pcode
+    case $PTTYPE in
+        gpt)
+            pname=$LIVEOS
+            pcode=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709 ;;
+        msdos) pt=primary
+            pcode=0xFE
+            if ((partNbr>=5)); then
+                pt=logical
+            elif ((partNbr>3)); then
+                pt=extended
+                run_parted $device unit B mkpart $pt $((end-512)) $((tds-z))
+                pt=logical
+                partNbr=5
+            fi
+    esac
+    run_parted $device unit B mkpart $pt ${pname:+$pname} \
+                                     $end $((end+rfs_ps-(1<<20))) \
+               type $partNbr $pcode
+#    case $PTTYPE in
+#        gpt) pt=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709 ;;
+#        msdos) pt=0xFE
+#    esac
+#    sfdisk --lock --part-type $device $partNbr $pt
+#    partprobe $device
+#    udevadm settle
+    rfs_p=$(aptPartitionName $device $partNbr)
+    case $PTTYPE in
+        gpt)
+            PARTUUID=$(sfdisk --lock --part-uuid $device $partNbr)
+            PARTUUID=${PARTUUID,,} ;;
+        msdos)
+            PARTUUID=$(lsblk -rno PARTUUID $rfs_p)
+    esac
 }
 
 checkFilesystem() {
-    local dev=$1
-    getdisk $dev
+    getdisk $TGTPT
+    local dev=$TGTPT
 
-    if [[ $dev == $device ]] && [[ -n $skipcopy ]]; then
+    if [[ $dev == $device ]] && [[ $skipcopy ]]; then
         printf "\n        ALERT:
-        --skipcopy for the purpose of reconfiguring an existing
-        installation should be invoked with a particular
+        --skipcopy/reconfig for the purpose of reconfiguring an
+        existing installation should be invoked with a particular
         partition.  Perhaps you want to reconfigure '%s'.\n
-        Exiting...\n" $(get_partition_name $device '1')
+        Exiting...\n" $(aptPartitionName $device '1')
         exitclean
     fi
-    TGTFS=$(blkid -s TYPE -o value $dev || :)
-    local t=$(lsblk -ndo TYPE $dev)
-    if [[ -n ${format[1]} ]] && [[ -z $skipcopy ]]; then
+    TGTFS=$(lsblk -ndo FSTYPE,TYPE $dev || :)
+    local t=${TGTFS##* }
+    TGTFS=${TGTFS%% *"$t"}
+    if [[ ${format[1]} ]] && [[ ! $skipcopy ]]; then
         if [[ part == $t ]]; then
             if [[ $2 == live ]]; then
                 printf "\n        ALERT:
@@ -1160,13 +1425,17 @@ checkFilesystem() {
         else
             TGTFS=${format[1]}
         fi
-    elif [[ $t == @(disk|loop|dm) ]]; then
+    elif [[ $t == @(disk|loop|dm) ]] && [[ ! $rfspartition ]]; then
         printf "\n        ALERT:
         '%s' is the %s device but not a partition on this device.
         Please designate the specific partition for loading the image.
         Perhaps you want '%s'.
-        Exiting...\n" $dev $t $(get_partition_name $dev '1')
+        Exiting...\n" $dev $t $(aptPartitionName $dev '1')
         exitclean
+    elif [[ ! $TGTFS ]]; then
+        format=("${rfs_v[@]}")
+        ((format+=format>>m))
+        TGTFS=${rfs_v[1]}
     fi
     if [[ $TGTFS != @(vfat|msdos|ext[432]|btrfs|xfs|f2fs) ]]; then
         printf "\n        ALERT:  '%s' is not a valid filesystem format for the
@@ -1175,23 +1444,31 @@ checkFilesystem() {
         exitclean
     fi
     falloc() {
-        # fallocate space $1 for a file $2.
+        # fallocate space $1 for a file $2 used as $3.
         truncate -s 0 $2
-        fallocate -l $1 $2
+        if [[ $3 == partition ]]; then
+        dd if=/dev/null of=$2 bs=1MiB count=1 seek=$(($1>>20)) status=progress
+        else
+            fallocate -l $1 $2
+        fi
     }
     case $TGTFS in
         ext[32])
             # fallocate not available in ext[32].
             falloc() {
-                truncate -s 0 $2
+            truncate -s 0 $2
+            if [[ $3 == partition ]]; then
+         dd if=/dev/null of=$2 bs=1MiB count=1 seek=$(($1>>20)) status=progress
+            else
                 dd if=/dev/zero of=$2 bs=1MiB count=$(($1>>20)) status=progress
+            fi
             }
             ;&
         ext[432]|btrfs|xfs|f2fs)
             CONFIG_FILE=extlinux.conf
-            if [[ -n ${format[1]} ]]; then
+            if [[ ${format[1]} ]]; then
                 # Check extlinux version & set mkfs version for boot partition.
-                dev=($(extlinux -v 2>&1))
+                dev=($(extlinux -v 2>&1 || :))
                 t=ext4
                 case ${dev[1]} in
                     3.*)
@@ -1201,8 +1478,8 @@ checkFilesystem() {
                     4.[0-9][0-9]|5.00)
                         [[ $TGTFS != xfs ]] && t=$TGTFS
                         ;;
-                    5.[0-9][1-9]|[6-9].[0-9][0-9]|extlinux:)
-                    # case extlinux: when command not found...
+                    5.[0-9][1-9]|[6-9].[0-9][0-9]|line)
+                    # case line nnnn: when extlinux: command not found...
                         t=$TGTFS
                 esac
                 mkfs=mkfs.$t
@@ -1211,10 +1488,10 @@ checkFilesystem() {
         btrfs)
             #FIXME Compression of $TGTMNT/syslinux interferes with EXTLINUX
             #      booting, but is ok for UEFI grub booting.
-            tgtmountopts=''  # '-o compress'
+            tgtmountops=''  # '-o compress'
             ;;
         vfat|msdos)
-            tgtmountopts='-o shortname=winnt,umask=0077'
+            tgtmountops='-o shortname=winnt,umask=0077'
             ((homesizeb == 4<<30)) && ((homesizeb-=512))
             ((overlaysizeb == 4<<30)) && ((overlaysizeb-=512))
             ((swapsizeb == 4<<30)) && ((swapsizeb-=512))
@@ -1224,22 +1501,21 @@ checkFilesystem() {
 }
 
 checkMounted() {
-    local tgtdev=$1
-    local live_mp
-    local m
+    local d live_mp m livedev livedir cmdline len ret
     # Allow --multi installations to live booted devices.
     if [[ -d $SRC ]]; then
-        local d="$SRC"
+        d="$SRC"
         # Find SRC mount point.
         SRC=$(findmnt -no TARGET -T "$d")
         if ! [[ $d -ef $SRC ]]; then
             srcdir=${d#$SRC/}
         fi
     fi
-    if [[ $SRC == @(live|/run/initramfs/live|/mnt/live) ]]; then
-        local cmdline=$(< /proc/cmdline)
-        local len=${#cmdline}
-        local ret=${cmdline#* rd.live.squashimg=}
+    if [[ $SRC == @(live|/run/initramfs/live|/mnt/live|/run/initramfs/livedev)
+                                                                       ]]; then
+        cmdline=$(< /proc/cmdline)
+        len=${#cmdline}
+        ret=${cmdline#* rd.live.squashimg=}
         if [[ ${#ret} != $len ]]; then
             squashimg=${ret%% *}
         fi
@@ -1255,17 +1531,17 @@ checkMounted() {
         ret=${cmdline#* iso-scan/filename=}
         if [[ ${#ret} != $len ]]; then
             m=$(mktemp -d)
-            mount $(realpath /run/initramfs/isoscandev) $m
-            SRC=$m${ret%% *}
+            mount -r $(realpath /run/initramfs/isoscandev) $m
+            SRC=$m/${ret%% *}
             srctype=live
+            # flag for iso-scan/filename boot
+            iso_mp=($m)  # array asignment in case of multiple mountpoints???
         fi
-        if [[ -n $liveram ]]; then
-            for f in /run/initramfs/squashed.img \
-                     /run/initramfs/rootfs.img ; do
-                if [[ -s $f ]]; then
-                    SRCIMG=$f
-                    break
-                fi
+        if [[ $liveram ]]; then
+            for f in /dev/shm/squashed.img /dev/shm/rootfs.img \
+                /run/initramfs/squashed.img /run/initramfs/rootfs.img; do
+                SRCIMG=$f
+                [[ -s $f ]] && break
             done
             srctype=live
         fi
@@ -1278,136 +1554,233 @@ checkMounted() {
     fi
     for live_mp in /run/initramfs/live /mnt/live ; do
         if mountpoint -q $live_mp; then
-            local livedev=$(findmnt -no SOURCE $live_mp)
-            local livedir=$(losetup -nO BACK-FILE /dev/loop0)
-            livedir=${livedir%/*}
-            livedir=${livedir/#$live_mp\/}
+            livedev=$(findmnt -no SOURCE $live_mp || :)
+            livedir=$(readlink /run/initramfs/live_dir) || {
+                livedir=$(readlink /run/overlayfs || :)
+                [[ ! $livedir ]] && livedir=$(losetup -nO BACK-FILE /dev/loop0)
+                livedir=LiveOS
+                livedir=${livedir%/*}
+                livedir=${livedir/#$live_mp\//} ;}
+            livedir=${livedir##*/}
             break
         fi
     done
     [[ $SRC == live || $SRC -ef $livedev ]] && SRC=$live_mp
-    [[ $tgtdev == live || $tgtdev -ef $livedev ]] && TGTDEV=$livedev
+    [[ $TGTPT == live || $TGTPT -ef $livedev ]] && TGTPT=$livedev
 
-    if [[ $SRC -ef $live_mp && -z $livedev ]] ||
-        [[ $tgtdev == live && -z $livedev ]]; then
+    if [[ $SRC -ef $live_mp && ! $livedev ]] ||
+        [[ $TGTPT == live && ! $livedev ]]; then
         printf '
         This host does not appear to be a LiveOS booted device.
         Exiting...'
         exitclean
-    elif [[ $livedev =~ $TGTDEV && -n ${format[1]} ]]; then
+    elif [[ $livedev =~ $TGTPT && ${format[1]} ]]; then
         printf "\n    NOTICE:
         You have requested --format of the currently booted LiveOS disk,
             '%s'\n
-        Exiting...\n\n" $TGTDEV
+        Exiting...\n\n" $TGTPT
         exitclean
-    elif [[ $srcdev =~ $TGTDEV  && -n ${format[1]} ]]; then
+    elif [[ $srcdev =~ $TGTPT  && ${format[1]} ]]; then
         printf "\n    NOTICE:
         You have requested --format of the LiveOS source disk,
             '%s'\n
-        Exiting...\n\n" $TGTDEV
+        Exiting...\n\n" $TGTPT
         exitclean
     fi
     if [[ $SRC -ef $live_mp ]]; then
         srcdir=$livedir
         srcdev=$livedev
     fi
-    if [[ $livedev -ef $tgtdev && $livedir == "$LIVEOS" ]]; then
+    if [[ $livedev -ef $TGTPT && $livedir == "$LIVEOS" && ! $clone ]]; then
         printf "\n    NOTICE:   The target installation directory, '%s',\n
         is your currently booted source directory.\n
         Please select a different target --livedir for this device.\n
                 Exiting..." $LIVEOS
         exitclean
     fi
-    if ! [[ $tgtdev -ef $livedev ]] && ! [[ $tgtdev -ef $srcdev ]]; then
-        if [[ -z ${format[1]} ]]; then
+    if ! [[ $TGTPT -ef $livedev ]] && ! [[ $TGTPT -ef $srcdev ]]; then
+        if [[ ! ${format[1]} ]] && ! [[ -d $1 ]]; then
             live_mp=''
-            for d in ${tgtdev}*; do
+            for d in ${TGTPT}*; do
                 local mountpoint=($(findmnt -nro TARGET $d || :))
                 for m in "${mountpoint[@]}"; do
-                    if [[ -n $m ]]; then
+                    if [[ $m ]]; then
                         printf "\n   NOTICE:  '%s' is mounted at '%s'." $d "$m"
                         live_mp=$m
                     fi
                 done
             done
-            if [[ -n $live_mp ]]; then
+            if [[ $live_mp ]]; then
                 printf '\n            Please unmount for safety.\n
                 Exiting...\n\n'
                 exitclean
             fi
         fi
-        if [[ $p == /devices/virtual/block/loop* ]] &&
-           [[ 1 == $(lsblk -rno RO $tgtdev) ]]; then
+        if [[ $ppath == /devices/virtual/block/loop* ]] &&
+           [[ 1 == $(lsblk -nrdo RO $TGTPT) ]]; then
             printf "\n   NOTICE: '%s' is attached READ-ONLY.
             The target device must be writable.
             Please adjust this.
-            Exiting...\n\n" $tgtdev
+            Exiting...\n\n" $TGTPT
             exitclean
-        elif [[ $p == /devices/virtual/block/dm-* ]] &&
-             [[ 1 == $(< /sys$p/dm/suspended) ]]; then
+        elif [[ $ppath == /devices/virtual/block/dm-* ]] &&
+             [[ 1 == $(< /sys"$ppath"/dm/suspended) ]]; then
             printf "\n   NOTICE: '%s' is suspended.
             Please adjust this.
-            Exiting...\n\n" $tgtdev
+            Exiting...\n\n" $TGTPT
             exitclean
-        elif [[ $(swapon -s) =~ ${tgtdev} ]]; then
+        elif [[ $(swapon -s) =~ ${TGTPT} ]]; then
             printf "\n   NOTICE:   Your chosen target device, '%s',\n
             is in use as a swap device.  Please disable swap if you want
-            to use this device.        Exiting..." $tgtdev
+            to use this device.        Exiting..." $TGTPT
             exitclean
         fi
     fi
 }
 
 detectsrctype() {
-    local f
-    if [[ -e $SRCMNT/Packages ]]; then
+    local f s
+    [[ -f $SRCMNT/$srcdir/../boot/grub2/grub.cfg ]] && GRUBonly=GRUBonly
+    if [[ -e $SRCMNT/$srcdir/../Packages ]]; then
         echo "/Packages found, will copy source packages to target."
         packages=packages
     fi
-    for f in "$SRCMNT/$srcdir/$squashimg" \
-            "$SRCMNT/$srcdir/rootfs.img" \
-            "$SRCMNT/$srcdir/ext3fs.img"; do
-        if [[ -s $f ]]; then
-            SRCIMG="$f"
-            srctype=live
-            break
+    [[ ! $SRCIMG ]] && {
+        for f in "$SRCMNT/$srcdir/$squashimg" \
+                "$SRCMNT/$srcdir/rootfs.img" \
+                "$SRCMNT/$srcdir/ext3fs.img"; do
+            if [[ -e $f ]]; then
+                SRCIMG=$f
+                srctype=live
+                break
+            fi
+        done
+        if [[ $SRC == /run/initramfs/live ]]; then
+#            s=$(dmsetup status)
+            if [[ $(dmsetup status) == \
+                  live-rw:\ +([0-9])\ +([0-9])\ linear\  ]]; then
+            printf "\n
+            NOTICE:  This image has a writable base root filesystem.\n
+            Only a clone (including all private files) may be replicated.\n
+            Press Enter to continue cloning the current state of this image,
+                or press Ctrl C to exit.\n"
+                read
+                clone=clone
+                rfs_call=clone
+                SRCIMG=/dev/mapper/live-rw
+            fi
         fi
-    done
+        [[ -h $f ]] && SRCIMG=$(realpath "$f") ;}
+    if [[ -f $SRCIMG ]] && [[ ! -s $SRCIMG ]]; then
+        printf "\n        ERROR:
+                '%s' appears to be empty.  Exiting...\n" "$SRCIMG"
+        exitclean
+    fi
+    if [[ $liveram && $iso_mp ]]; then
+        if RFSwasMounted=$(findmnt -nro TARGET /dev/live-base); then
+            IMGMNT=$RFSwasMounted
+        else
+            SRCIMG=/dev/mapper/live-base
+            RFSIMG=$SRCIMG
+        fi
+        # ssc = source structure code
+        ssc=E
+    else
+        RFSwasMounted=($(findmnt -nro TARGET $SRCIMG)) && IMGMNT=$RFSwasMounted
+    fi
+    [[ $clone ]] && srctype=clone
     SRCFS=$(findmnt -no FSTYPE $SRCMNT)
     # netinstall iso has no SRCIMG.
-    if [[ -n "$SRCIMG" ]]; then
-        IMGMNT=$(mktemp -d /run/imgtmp.XXXXXX)
-        mount -r "$SRCIMG" $IMGMNT || exitclean
-        if [[ -d $IMGMNT/proc ]]; then
-            flat_squashfs=flat_squashfs
-            RFSIMG="$SRCIMG"
+    if [[ $SRCIMG ]]; then
+        s=-r
+        [[ $IMGMNT ]] || {
+            IMGMNT=$(mktemp -d /tmp/imgmnt.XXXX)
+            mount $s "$SRCIMG" $IMGMNT || exitclean
+            }
+        if [[ -d $IMGMNT/bin ]]; then
+            [[ $liveram && $iso_mp ]] || {
+                flat_srcimg=flat_srcimg
+                RFSIMG=$SRCIMG
+                ssc=F
+                [[ -b $SRCIMG ]] && ssc=S
+                case $SRCIMG in
+                    /dev/mapper/live-rw)
+                        SRCIMG=$f ;&
+                    /run/initramfs/rootfs.img)
+                        ssc=X
+                esac ;}
         else
-            for f in $IMGMNT/LiveOS/rootfs.img $IMGMNT/LiveOS/ext3fs.img; do
-                [[ -s $f ]] && RFSIMG=$f && break
-            done
-            mount -r $RFSIMG $IMGMNT || exitclean
+            if [[ $SRC != @(live|/run/initramfs/live|/mnt/live) ]]; then
+                RFSIMG=$IMGMNT/LiveOS/rootfs.img
+                [[ -s $RFSIMG ]] || RFSIMG=$IMGMNT/LiveOS/ext3fs.img
+                ssc=E
+            elif ! [[ $clone ]]; then
+                if [[ -b /dev/mapper/live-base ]]; then
+                    RFSIMG=/dev/mapper/live-base
+                    ssc=E
+#                elif [[ -b /dev/mapper/live-rw ]]; then
+#                    RFSIMG=/
+#                    ssc=E
+#                    s+=' --bind'
+                elif [[ -d /run/rootfsbase ]]; then
+                    RFSIMG=/run/rootfsbase
+                    s+=' --bind'
+                fi
+            fi
+            mount $s $RFSIMG $IMGMNT || exitclean
         fi
-        # list file as deleted module directory may have remnant files.
-        kver=($(ls -vr $IMGMNT/usr/lib/modules/*/vmlinuz))
+        IMGFS=($(findmnt -nbo FSTYPE,USED $IMGMNT))
+        [[ ${IMGFS[0]} == squashfs ]] && sqfssrc=sqfssrc
+        rfs_sz=${IMGFS[-1]}
+        IMGFS=${IMGFS[-2]}
+        # Use source filesystem type if not specified.
+        [[ -R rfs_v ]] || rfs_v=unsqfs
+        [[ ${rfs_v[1]} == @(''|ext4) ]] && rfs_v[1]=$IMGFS
+        if [[ ! $sqfssrc ]] && [[ ! $liveram ]]; then
+            if [[ $ssc == S ]]; then
+                ssc=P
+                [[ $clone ]] || { [[ $skipcopy ]] || { printf "\n
+            NOTICE:  This image has a writable base root filesystem.\n
+            Only a clone (including all private files) may be replicated.\n
+            Press Enter to continue cloning the current state of this image,
+                or press Ctrl C to exit.\n"
+                    read; }
+                clone=clone
+                IMGMNT=/
+                RFSIMG=/
+                IMGFS=($(findmnt -nbo FSTYPE,USED $IMGMNT))
+                [[ ${IMGFS[0]} == squashfs ]] && sqfssrc=sqfssrc
+                rfs_sz=${IMGFS[-1]}
+                [[ $rfs_call ]] || rfs_call=clone
+                srctype=clone; }
+            elif [[ $IMGFS != squashfs ]]; then
+                ssc=X
+            fi
+        fi
+        # list file, as deleted module directory may have remnant files.
+        k='/usr/lib/modules/*/vmlinuz'
+        [[ $clone ]] || k=$IMGMNT$k
+        [[ -d $IMGMNT/usr/lib/modules ]] || { k=${k/\/usr/}; k=${k%/*}; }
+        kver=($(ls -vr $k))
         kver=(${kver[@]%/*}); kver=(${kver[@]##*/})
-        if [[ $TGTFS == ext4 ]]; then
+        if [[ $TGTFS == ext4 ]] && ! [[ $GRUBonly ]]; then
             f=$(which syslinux)
             f="$(sed -nr '0,/SYSLINUX (\S+) .*/ s//\1/ p' $f)"$'\n'6.04
             [[ $f == $(sort -rV <<< "$f") ]] || _64bit=_64bit
         fi
-        umount -l $IMGMNT $IMGMNT 2>/dev/null || :
+        [[ $RFSwasMounted ]] || umount -l $IMGMNT $IMGMNT 2>/dev/null || :
     fi
-    [[ -n $srctype ]] && return
+    [[ $srctype ]] && return
 
     if [[ -e $SRCMNT$IMGMNT/images/install.img ]] ||
-        [[ -e $SRCMNT/isolinux/initrd.img ]]; then
-        if [[ -n $packages ]]; then
+        [[ -e $SRCMNT/$srcdir/../isolinux/initrd.img ]]; then
+        if [[ $packages ]]; then
             srctype=installer
         else
             srctype=netinst
         fi
         imgtype=install
-        if ! [[ -e $SRCMNT/images/install.img ]]; then
+        if ! [[ -e $SRCMNT/$srcdir/../images/install.img ]]; then
             echo "$SRC uses initrd.img w/o install.img"
             imgtype=initrd
         fi
@@ -1418,7 +1791,7 @@ detectsrctype() {
 }
 
 get_label() {
-    udevadm settle
+    udevadm trigger --settle --name-match=$1
     local label=($(lsblk -no LABEL $1 || :))
     # Use compound array assignment to accommodate multiple partitions if
     # a parent device is passed, such as for a loop device.
@@ -1456,7 +1829,7 @@ fi
 set -eE
 set -o pipefail
 set -o braceexpand
-trap exitclean EXIT
+trap exitclean EXIT SIGINT
 shopt -s extglob
 
 cryptedhome=cryptedhome
@@ -1465,8 +1838,9 @@ homesizeb=''
 copyhome=''
 copyhomesize=''
 swapsizeb=''
-overlay=''
-overlayfs=''
+nooverlay=''
+builder=$USERNAME
+OverlayFS=''
 overlaysizeb=''
 copyoverlay=''
 copyoverlaysize=''
@@ -1485,6 +1859,8 @@ SRCwasMounted=''
 syslinuxboot=syslinux
 bootloaderarch=''
 
+declare -n rfs_v
+
 while true ; do
     case $1 in
         --help | -h | -?)
@@ -1494,41 +1870,9 @@ while true ; do
             noverify=noverify
             ;;
         --format)
-            declare -a 'format=({'"$2"'})'
-            i=${#format[@]}
-            case $format in
-                {*)
-                    format=${format//[{\}]/}
-                    ;;&
-                {[[:digit:]]*)
-                    i=0
-            esac
-            case $i in
-                1)
-                    format=('' $format)
-                    i=2
-                    case ${format[1]} in
-                        --msdos)
-                            format[1]=msdos
-                            ;;
-                        --*)          # next option (implicit size and type)
-                            format[1]=ext4
-                            i=1
-                    esac
-                    checkfstype ${format[1]} dev
-                    shift $i
-                    continue
-                    ;;
-                [2-9])
-                    [[ $format == [[:alpha:]]* ]] && format=('' ${format[@]})
-            esac
-            checkfstype ${format[1]:=ext4} dev
-            if [[ -n $format ]]; then
-                checkinput $format format
-                ((format<<=20))
-            fi
-            [[ -n ${format[2]} ]] &&
-                checkinput ${format[2]} blocksize ${format[1]} dev
+            fsinput format "$2"
+            [[ $s ]] && shift $s && continue
+            fsinput2 format
             shift
             ;;
         --msdos)
@@ -1543,9 +1887,6 @@ while true ; do
         --noesp)
             noesp=noesp
             ;;
-        --nomac)
-            nomac=nomac
-            ;;
         --skipcopy|--reconfig)
             skipcopy=skipcopy
             ;;
@@ -1555,7 +1896,7 @@ while true ; do
             ;;
         --xo)
             xo=xo
-            skipcompress=skipcompress
+            unsqfs=unsqfs
             ;;
         --xo-no-home)
             xonohome=xonohome
@@ -1587,30 +1928,71 @@ while true ; do
             LIVEOS=$2
             shift
             ;;
-        --compress)
-            skipcompress=''
+        --compress|--flat-sqfsimg|--embedded-fsimg)
+            rfs_call=${1#--}
+            case $rfs_call in
+                # tsc = target structure code
+                embedded-fsimg) tsc=E ;;
+                compress|flat-sqfsimg) tsc=F ;;
+            esac
+            fsinput mksqfs "$2"
+            rfs_v=mksqfs
+            [[ $s ]] && shift $s && continue
+            fsinput2 mksqfs
+            shift
             ;;
-        --skipcompress)
-            skipcompress=skipcompress
+        --unsquashfs|--skipcompress|--rfspartition)
+            case ${1#--} in
+                rfspartition) tsc=P ;;
+                skipcompress|unsquashfs) tsc=X ;;
+            esac
+            [[ $1 == --rfspartition ]] && rfspartition=rfspartition
+            if [[ $rfspartition ]] && [[ $2 =~ squashfs ]]; then
+                tsc=S        # SqFS-partition
+                rfs_call=mksqfs
+                rfspartition=squashfs
+                fsinput mksqfs "$2"
+                rfs_v=mksqfs
+            else
+                fsinput unsqfs "$2"
+                rfs_v=unsqfs
+                rfs_call=expand
+            fi
+            [[ $s ]] && shift $s && continue
+            if [[ $rfspartition == squashfs ]]; then
+                fsinput2 mksqfs
+            else
+                fsinput2 unsqfs
+                rfs_call=expand
+            fi
+            shift
             ;;
         --no-overlay)
-            overlay=none
+            nooverlay=nooverlay
+            ;;
+        --clone)
+            clone=clone
+            mksqfs=clone
+            rfs_call=clone
+#            fsinput clone "$2"
+#            [[ $s ]] && shift $s && continue
+#            shift
+            ;;
+        --builder)
+            builder=$2
+            shift
             ;;
         --overlayfs)
-            overlayfs=overlayfs
+            OverlayFS=OverlayFS
             if [[ $2 == temp ]]; then
-                overlayfs=temp
+                OverlayFS=temp
                 shift
             fi
             ;;
         --overlay-size-mb)
-            declare -a 'overlaysizeb=({'"$2"'})'
-            overlaysizeb=${overlaysizeb//[{\}]/}
-            checkinput $overlaysizeb ovl
-            ((overlaysizeb<<=20))
-            [[ -n ${overlaysizeb[1]} ]] && checkfstype ${overlaysizeb[1]} ovl
-            [[ -n ${overlaysizeb[2]} ]] &&
-                checkinput ${overlaysizeb[2]} blocksize ${overlaysizeb[1]} ovl
+            fsinput overlaysizeb "$2"
+            [[ $s ]] && shift $s && continue
+            fsinput2 overlaysizeb
             shift
             ;;
         --copy-overlay)
@@ -1620,13 +2002,9 @@ while true ; do
             resetoverlay=resetoverlay
             ;;
         --home-size-mb)
-            declare -a 'homesizeb=({'"$2"'})'
-            homesizeb=${homesizeb//[{\}]/}
-            checkinput $homesizeb home
-            ((homesizeb<<=20))
-            [[ -n ${homesizeb[1]} ]] && checkfstype ${homesizeb[1]} home
-            [[ -n ${homesizeb[2]} ]] &&
-                checkinput ${homesizeb[2]} blocksize ${homesizeb[1]} home
+            fsinput homesizeb "$2"
+            [[ $s ]] && shift $s && continue
+            fsinput2 homesizeb
             shift
             ;;
         --copy-home)
@@ -1678,31 +2056,20 @@ if [[ $# -ne 2 ]]; then
     exit 1
 fi
 
-if [[ ${format[1]} == @(ext[432]|btrfs|xfs) ]] &&
-    ! type extlinux >/dev/null 2>&1; then
-    printf "
-    NOTICE:  The EXTLINUX boot loader is not installed on the host computer.
-    Legacy booting of the '%s' root filesystem may not be available.\n
-    UEFI booting by GRUB or another boot loader may be available
-    depending on target systems & firmware.\n
-    EXTLINUX may be installed by running the command:\n
-        sudo dnf install syslinux-extlinux\n
-    Press Enter to continue, or Ctrl C to abort.\n\n" ${format[1]}
-fi
-
 if [[ $1 == live ]]; then
     SRC=live
 else
     SRC=$(readlink -f "$1") || :
 fi
 if [[ $2 == live ]]; then
-    TGTDEV=$(realpath $(readlink /run/initramfs/livedev)) || (printf "
-    ERROR:  There is no running LiveOS system to target.\n\n" && exitclean)
+    TGTPT=$(realpath /run/initramfs/livedev) || { printf "
+    ERROR:  There is no running LiveOS system to target.\n\n" && exitclean ;}
+    [[ $clone ]] && clone=live
 else
-    TGTDEV=$(readlink -f "$2") || :
+    TGTPT=$(realpath "$2") || :
 fi
 
-if [[ -z $SRC ]]; then
+if [[ ! $SRC ]]; then
     shortusage
     echo "Missing source"
     exit 1
@@ -1714,24 +2081,23 @@ if ! [[ -f $SRC || -b $SRC || -d $SRC || live == $SRC ]]; then
     exit 1
 fi
 
-if [[ -z $TGTDEV ]]; then
+if [[ ! $TGTPT ]]; then
     shortusage
     echo "Missing target device"
     exit 1
 fi
 
-if ! [[ -b $TGTDEV || live == $TGTDEV ]]; then
+if ! [[ -b $TGTPT || -d $TGTPT || live == $TGTPT ]]; then
     shortusage
     echo "
-    ERROR:  '$TGTDEV' is not a block device."
+    ERROR:  '$TGTPT' is not a block device or directory."
     exit 1
 fi
 echo -e "\nSource image is '$SRC'"
 
 # Do some basic sanity checks.
-checkForSyslinux
-checkFilesystem $TGTDEV $2
-checkMounted $TGTDEV
+checkFilesystem
+checkMounted $2
 
 if [[ $LIVEOS =~ [[:space:]]|/ ]]; then
     printf "\n    ALERT:
@@ -1743,7 +2109,7 @@ if [[ $LIVEOS =~ [[:space:]]|/ ]]; then
     printf "'$LIVEOS'\n\n"
 fi
 
-[[ $overlayfs == overlayfs ]] && overlayfs=$TGTFS
+[[ $OverlayFS == OverlayFS ]] && OverlayFS=$TGTFS
 
 f() {
     # format parameter string
@@ -1751,18 +2117,18 @@ f() {
     f=${f// /,}; f=${f%%+(,)}
     echo $f
 }
-
-case $overlayfs in
+na='!('')'
+case $OverlayFS in
     vfat|msdos)
-        [[ -z $overlaysizeb ]] && {
+        [[ ! $overlaysizeb ]] && {
         printf '\n        ALERT:
         If the target filesystem is formatted as vfat or msdos, you must
-        specify an --overlay-size-mb <size> value for an embedded overlayfs.\n
+        specify an --overlay-size-mb <size> value for an embedded OverlayFS.\n
         Exiting...\n'
         exitclean; }
         ;;
     temp)
-        [[ -n $overlaysizeb ]] && {
+        [[ $overlaysizeb ]] && {
         printf '\n        ERROR:
         You have specified --overlayfs temp AND --overlay-size-mb %s.\n
         --overlay-size-mb is only appropriate for persistent overlays on
@@ -1771,59 +2137,51 @@ case $overlayfs in
         \n' $(f)
         exitclean; }
         ;;
-    !(''))
-        if [[ -n $overlaysizeb ]]; then
-            printf '\n    Notice:
-            An OverlayFS overlay within an %s-formatted partition
-            will use a union mount directory and does not need a
-            separate --overlay-size-mb persistent overlay file.
-            The option \033[1m--overlay-size-mb %s\033[0m will be ignored.
-            \n\r' $TGTFS $(f)
-            unset -v overlaysizeb
-        fi
+#    $na)
+#        if [[ $overlaysizeb ]]; then
+#            printf '\n    Notice:
+#            An OverlayFS overlay within an %s-formatted partition
+#            will use a union mount directory and does not need a
+#            separate --overlay-size-mb persistent overlay file.
+#            The option \033[1m--overlay-size-mb %s\033[0m will be ignored.
+#            \n\r' $TGTFS $(f)
+#            unset -v 'overlaysizeb'
+#        fi
 esac
 
-[[ -z $label ]] && label=$(get_label $TGTDEV)
+[[ ! $label ]] && label=$(get_label $TGTPT)
 
-case ${#overlaysizeb[@]} in
-0)
-    [[ $overlayfs == @(vfat|msdos) ]] && {
-        printf '\n        ALERT:
-        If the target filesystem is formatted as vfat or msdos, you must
-        specify an --overlay-size-mb <size> value for an embedded overlayfs.\n
-        Exiting...\n'
-        exitclean; }
-    ;;
-*)
-    if [[ $TGTFS == @(vfat|msdos) ]] && ((overlaysizeb >= 4<<30)); then
-        printf '\n        ALERT:
-        An overlay size greater than 4096 MiB
-        is not allowed on VFAT formatted filesystems.\n'
-        exitclean
-    fi
-    if [[ -z ${format[1]} ]] && [[ $label =~ [[:space:]] ]]; then
-        printf '\n        ALERT:
+if [[ $label =~ [[:space:]] ]]; then
+    f=${label//[[:space:]]/_}
+    printf "\n        ALERT:
         The LABEL (%s) on %s has spaces, newlines, or tabs in it.
-        Whitespace does not work with the overlay.
-        An attempt to rename the device will be made.\n\n' "$label" $TGTDEV
-        label=${label//[[:space:]]/_}
-    fi
-    [[ $overlaysizeb ]] && [[ $overlay == none ]] && {
-        printf '\n        ERROR:
-            You have specified --no-overlay AND --overlay-size-mb <size>.\n
-            Only one of these options may be requested at a time.\n
-            Please request only one of these options.  Exiting...\n'
-        exitclean; }
-    ;;&
-[2-9])
-    [[ -z $overlayfs ]] &&
-        printf '\n    Notice:
+        Whitespace in the label does not work with overlays.
+        An attempt to rename the device to '%s' will be made.\n
+        " "$label" $TGTPT "$f"
+    label=$f
+fi
+if [[ $TGTFS == @(vfat|msdos) ]] && ((overlaysizeb >= 4<<30)); then
+    printf '\n        ALERT:
+    An overlay size greater than 4096 MiB
+    is not allowed on VFAT formatted filesystems.\n'
+    exitclean
+fi
+if [[ $overlaysizeb || $OverlayFS ]] && [[ $nooverlay ]]; then
+    printf '\n        ERROR:
+        You have specified --no-overlay AND --overlay-size-mb <size> or
+        --overlayfs.  --no-overlay is inconsistent with either overlay
+        option.\n
+        Please request only one of these options.  Exiting...\n'
+    exitclean
+fi
+if [[ ${#overlaysizeb[@]} == [2-9] ]] && [[ $OverlayFS ]]; then
+    printf '\n    Notice:
         A Device-mapper overlay file does not need an embedded filesystem.
         Only the size option in \033[1m--overlay-size-mb %s\033[0m is
         relevant.\n' $(f)
-esac
+fi
 
-if [[ -n $homesizeb ]] && [[ $TGTFS == @(vfat|msdos) ]]; then
+if [[ $homesizeb ]] && [[ $TGTFS == @(vfat|msdos) ]]; then
     if ((homesizeb >= 4<<30)); then
         printf '\n      NOTICE:
         A file on a FAT filesystem cannot be larger than 4096 MiB.\n\n'
@@ -1831,14 +2189,14 @@ if [[ -n $homesizeb ]] && [[ $TGTFS == @(vfat|msdos) ]]; then
     fi
 fi
 
-if [[ -n $swapsizeb ]] && [[ $TGTFS == @(vfat|msdos) ]]; then
+if [[ $swapsizeb ]] && [[ $TGTFS == @(vfat|msdos) ]]; then
     if ((swapsizeb >= 4<<30)); then
         echo "Can't have a swap file greater than 4096 MB on VFAT"
         exitclean
     fi
 fi
 
-if [[ -z $noverify ]] && checkisomd5 --md5sumonly "$SRC" &>/dev/null; then
+if [[ ! $noverify ]] && checkisomd5 --md5sumonly "$SRC" &>/dev/null; then
     # verify the image
     echo 'Verifying image...'
     if ! checkisomd5 --verbose "$SRC"; then
@@ -1849,14 +2207,14 @@ if [[ -z $noverify ]] && checkisomd5 --md5sumonly "$SRC" &>/dev/null; then
     fi
 fi
 
-SRCMNT=$(mktemp -d /run/srctmp.XXXXXX)
+SRCMNT=$(mktemp -d /tmp/srctmp.XXXXXX)
 srcmountopts='-o ro'
 if [[ -f $SRC ]]; then
     d=($(losetup -nO NAME -j $SRC))
     # ^ Use compound array assignment to accommodate multiple attachments.
-    if [[ -n $d ]]; then
+    if [[ $d ]]; then
         SRCwasMounted=($(lsblk -nro MOUNTPOINT $d))
-        [[ -z $SRCwasMounted ]] && SRC=$d
+        [[ ! $SRCwasMounted ]] && SRC=$d
     else
         srcmountopts+=,loop
     fi
@@ -1873,15 +2231,15 @@ elif ! [[ -b $SRC ]]; then
     exitclean
 elif [[ -b $SRC ]] && [[ $(lsblk -ndo TYPE $SRC) == part ]]; then
     SRCwasMounted=$(lsblk -nro MOUNTPOINT $SRC)
-    [[ $SRC -ef $TGTDEV ]] && srcmountopts=''
+    [[ $SRC -ef $TGTPT ]] && srcmountopts=''
 else
     printf "\n    ATTENTION:
     '%s' is not a block device partition.
-    Perhaps you want partition '%s'.\n\n" $SRC $(get_partition_name $SRC '1')
+    Perhaps you want partition '%s'.\n\n" $SRC $(aptPartitionName $SRC '1')
     exitclean
 fi
 
-if [[ -n $SRCwasMounted ]]; then
+if [[ $SRCwasMounted ]]; then
     rmdir $SRCMNT
     SRCMNT=$SRCwasMounted
 else
@@ -1891,43 +2249,52 @@ trap exitclean SIGINT SIGTERM
 
 # Figure out what needs to be done based on the source image.
 detectsrctype
+[[ $GRUBonly ]] && syslinuxboot=missing || checkForSyslinux
 
-if [[ -n $flat_squashfs ]]; then
-    if [[ -z $overlayfs ]]; then
-        if [[ $TGTFS == @(vfat|msdos) ]] && [[ -z $overlaysizeb ]]; then
-            printf  "\n        ALERT:
-            The source has a flat SquashFS structure that requires an OverlayFS
-            overlay specified by the --overlayfs option.\n
-            Because the target device filesystem has a '"$TGTFS"' format, you
-            must specify an --overlay-size-mb <size> value for an embedded
-            OverlayFS.\n
-            Exiting...\n\n"
-            exitclean
-        elif [[ -z $overlaysizeb ]]; then
-            overlayfs=temp
-        else
-            overlayfs=$TGTFS
-        fi
-    elif [[ -n $overlaysizeb ]] && [[ $TGTFS != @(vfat|msdos) ]]; then
-        printf  "\n        Notice:
-        The source has a flat SquashFS structure that requires an OverlayFS
-        overlay.\n
-        Because the target device filesystem has an '"$TGTFS"' format, you need
-        NOT specify an --overlay-size-mb <size> value to hold an embedded
-        OverlayFS.\n
-            That option will be ignored...\n\n"
-        unset -v overlaysizeb
-    fi
+if [[ ${format[1]} == @(ext[432]|btrfs|xfs) ]] && ! [[ $GRUBonly ]] &&
+    ! type extlinux >/dev/null 2>&1; then
+    printf "
+    NOTICE:  The EXTLINUX boot loader is not installed on the host computer.
+    Legacy booting of the '%s' root filesystem may not be available.\n
+    UEFI booting by GRUB or another boot loader may be available
+    depending on target systems & firmware.\n
+    EXTLINUX may be installed by running the command:\n
+        sudo dnf install syslinux-extlinux\n
+    Press Enter to continue, or Ctrl C to abort.\n\n" ${format[1]}
+fi
+
+#if [[ $mksqfs ]] && [[ $rfs_call != embedded-fsimg ]]; then
+#    if [[ -f $SRCIMG ]] && [[ $flat_srcimg ]] && [[ $IMGFS == squashfs ]]; then
+#            [[ ! $clone ]] && printf  "\n        Notice:
+#            The source already has a flat SquashFS image structure.\n
+#            The --flat-sqfsimg option will be ignored.\n
+#            "
+#        unset -v 'mksqfs'
+##    else
+##        flat_srcimg=2bflat_srcimg
+#    fi
+##elif [[ ! $sqfssrc ]] && [[ $unsqfs && ! $rfspartition ]]; then
+#    printf "\n        Notice:
+#    The source image is uncompressed. The '--unsquashfs %s' option will
+#    be ignored.\n\n" ${unsqfs[1]}
+#    unset -v 'unsqfs'
+#fi
+if [[ $nooverlay ]] && [[ $tsc == @(E|F|S) ]]; then
+    unset -v 'nooverlay'
+    printf '\n        ALERT:
+        The --no-overlay option is inconsistent with  a --flat-sqfsimg,
+        --rfspartition squashfs, or a --compress request.\n
+        The --no-overlay request will be ignored.\n'
 fi
 
 if [[ $srctype != live ]]; then
-    if [[ -n $homesizeb ]]; then
+    if [[ $homesizeb ]]; then
         printf '\n        ALERT:
         The source is not for a live installation. A home.img filesystem is not
         useful for netinst or installer installations.\n
         Please adjust your home.img options.  Exiting...\n\n'
         exitclean
-    elif [[ -n $overlaysizeb ]]; then
+    elif [[ $overlaysizeb ]]; then
         printf '\n        ALERT:
         The source is not for a live installation. A overlay file is not
         useful for netinst or installer installations.\n
@@ -1936,7 +2303,7 @@ if [[ $srctype != live ]]; then
     fi
 fi
 
-if [[ -n $copyoverlay ]]; then
+if [[ $copyoverlay ]]; then
     SRCOVL=($(find $SRCMNT/$srcdir/ -name overlay-* -print || :))
     if [[ ! -s $SRCOVL ]]; then
         printf '\n   NOTICE:
@@ -1947,7 +2314,7 @@ if [[ -n $copyoverlay ]]; then
         copyoverlay=''
     fi
 fi
-if [[ -n $copyoverlay && -n $overlaysizeb ]]; then
+if [[ $copyoverlay && $overlaysizeb ]]; then
     printf '\n        ERROR:
         You requested a new overlay AND to copy one from the source.\n
         Please request only one of these options.  Exiting...\n'
@@ -1965,34 +2332,35 @@ efibootdir() {
     fi
 }
 
-TGTMNT=$(mktemp -d /run/tgttmp.XXXXXX)
+TGTMNT=$(mktemp -d /tmp/tgttmp.XXXXXX)
 if ! [[ ${format[1]} ]]; then
     if [[ $TGTFS == f2fs ]]; then
-        ! [[ $(dump.f2fs $TGTDEV) =~ extra_attr ]] || xa=force
-    elif ! findmnt -no SOURCE $TGTDEV >/dev/null 2>&1; then
-        fscheck $TGTFS $TGTDEV
+        ! [[ $(dump.f2fs $TGTPT) =~ extra_attr ]] || xa=force
+    elif ! findmnt -no SOURCE $TGTPT >/dev/null 2>&1; then
+        fscheck $TGTFS $TGTPT $device
     fi
 
-    mount $tgtmountopts $TGTDEV $TGTMNT || exitclean
+    mount ${tgtmountops:+$tgtmountops} $TGTPT $TGTMNT || exitclean
 
     efibootdir $TGTMNT T_EFI_BOOT
 
     [[ $TGTFS == f2fs ]] &&
         ! b=$(grep "a F2FS filesystem" $TGTMNT$T_EFI_BOOT/grubx64.efi \
-                                       $TGTMNT$T_EFI_BOOT/BOOTX64.EFI 2>&1)
+                                       $TGTMNT$T_EFI_BOOT/BOOTX64.EFI \
+                                        >/dev/null 2>&1)
 fi
 
-efibootdir $SRCMNT EFI_BOOT
+efibootdir $SRCMNT/$srcdir/.. EFI_BOOT
 
-if [[ -n $efi && -z $EFI_BOOT ]]; then
+if [[ $efi && ! $EFI_BOOT ]]; then
     printf '\n        ATTENTION:
     You requested EFI booting, but this source image lacks support
     for EFI booting.  Exiting...\n'
     exitclean
 elif [[ $TGTFS == f2fs ]] && [[ $xa != force ]] && xa=${format[*]:3} &&
     ! [[ $xa =~ extra_attr ]] && xa='' && ! [[ $xa ]] && ! [[ $b ]] &&
-    ! b=$(grep "a F2FS filesystem" $SRCMNT$EFI_BOOT/grubx64.efi \
-                                   $SRCMNT$EFI_BOOT/BOOTX64.EFI 2>&1) &&
+    ! b=$(grep "a F2FS filesystem" $SRCMNT/$srcdir/..$EFI_BOOT/grubx64.efi \
+                            $SRCMNT/$srcdir/..$EFI_BOOT/BOOTX64.EFI 2>&1) &&
     ! [[ -d /usr/lib/grub/x86_64-efi ]]; then
         printf '
         NOTICE:  The source GRUB EFI binary does not contain the F2FS module.
@@ -2015,62 +2383,60 @@ elif [[ $TGTFS == f2fs ]] && [[ $xa != force ]] && xa=${format[*]:3} &&
         read
 fi
 
-if [[ -d $SRCMNT/isolinux/ ]]; then
-    CONFIG_SRC=$SRCMNT/isolinux
+boot_src=$SRCMNT/$srcdir
+if [[ -d $boot_src/../isolinux/ ]]; then
+    boot_src=$boot_src/../isolinux
 # Adjust syslinux sources for replication of installed images
 # between filesystem types.
-elif [[ -d $SRCMNT/syslinux/ ]]; then
-    [[ -d $SRCMNT/$srcdir/syslinux ]] && CONFIG_SRC="$srcdir"/
-    CONFIG_SRC="$SRCMNT/${CONFIG_SRC}syslinux"
-elif [[ -d $SRCMNT/images/pxeboot/ ]]; then
-    CONFIG_SRC=$SRCMNT/images/pxeboot
-else
-    for arch in aarch64 ppc64le x86_64; do
-        if [[ -d $SRCMNT/boot/$arch/loader ]]; then
-	    CONFIG_SRC="$SRCMNT/boot/$arch/loader"
-	    bootloaderarch=$arch
-        fi
-    done
-fi
-if [[ ! -d ${CONFIG_SRC} ]]; then
-    printf '\n        ATTENTION:
-    A bootable kernel and initial ram disk could not be found.  Exiting...\n'
-    exitclean
+elif [[ -d $boot_src/../syslinux/ ]]; then
+    [[ -d $boot_src/syslinux ]] || boot_src=${boot_src%/*}
+    boot_src=$boot_src/syslinux
+elif [[ $GRUBonly ]]; then
+    [[ -d $boot_src/images ]] || boot_src=${boot_src%/*}
+    boot_src=$boot_src/images/pxeboot
 fi
 
-i=${CONFIG_SRC}/initrd?(*.img)
-cd /tmp
-rm -rf usr
-ikernel=$(lsinitrd $i --unpack -f usr/lib/modules/*/kernel -v 2>&1)
-ikernel=${ikernel%/*}; ikernel=${ikernel##*/}
-rm -rf usr
-cd - >/dev/null 2>&1
-f=$(file ${CONFIG_SRC}/?(vm)linu[xz]*)
-f=${f#*version }; f=${f%% *}
-a=''; d=''
-if ! [[ "${kver[*]}" =~ $f ]]; then
-    k="${kver[*]}"; k="${k// /$'\n'}"
-    a="* is not among those installed in the base root filesystem:
-$k"
-fi
-[[ $ikernel != $kver ]] &&
-    d="* does not match that in the initial ram filesystem, '${ikernel}'"
-if [[ $a || $d ]]; then
-    printf "\n  NOTICE:  The boot kernel version, '%s',
+check_kernel() {
+    i=${boot_src}/initrd*.img
+    cd /tmp
+    rm -rf --one-file-system -- usr
+    k='usr/lib/modules/*/modules.devname'
+    [[ -d $IMGMNT/usr/lib/modules ]] || k=${k/\/usr/}
+    ikernel=$(lsinitrd $i --unpack -f $k -v 2>&1)
+    ikernel=${ikernel%/*}; ikernel=${ikernel##*/}
+    rm -rf --one-file-system -- usr
+    cd - >/dev/null 2>&1
+    k=/usr/lib/modules/$kver/vmlinuz*
+    [[ $clone ]] || k=${boot_src}/vmlinuz*
+    f=$(file $k)
+    f=${f#*version }; f=${f%% *}
+    a=''; d=''
+    if ! [[ "${kver[*]}" =~ $f ]]; then
+        k="${kver[*]}"; k="${k// /$'\n'}"
+        a="* is not among those installed in the base root filesystem:
+    $k"
+    fi
+    [[ $ikernel != $kver ]] &&
+        d="* does not match that in the initial RAM filesystem,
+    ${ikernel}"
+    if [[ $a || $d ]]; then
+        printf "\n    NOTICE:\n    The boot kernel version,\n
     %s
-    %s
+        %s\n
+        %s
 
-    The kernel may have been upgraded and reside in an overlay.
+        The kernel may have been upgraded and reside in an overlay.
 
-    If the boot kernel version is not available in the root filesystem
-    or match the initial ram filesystem version, the booted operating system
-    will most likely fail.\n
-    Press Ctrl C to abort, or, if this is expected,
-                               press 'Enter' to continue.\n" $f "$a" "$d"
-    read
-fi
-
-if [[ -n $overlayfs && -z $(lsinitrd $i\
+        If the boot kernel version is not available in the root filesystem
+        or match the initial RAM filesystem version, the booted operating system
+        will most likely fail.\n
+        Press Ctrl C to abort, or, if this is expected,
+                                   press 'Enter' to continue.\n" $f "${a}" "$d"
+        read
+    fi
+}
+[[ $srctype == @(live|clone) ]] && check_kernel
+if [[ $OverlayFS && ! $(lsinitrd $i\
     -f usr/lib/dracut/hooks/cmdline/30-parse-dmsquash-live.sh | \
     sed -n -r '/(dev\/root|rootfsbase)/p') ]]; then
     printf "\n    NOTICE:
@@ -2082,6 +2448,15 @@ if [[ -n $overlayfs && -z $(lsinitrd $i\
     read
 fi
 
+_iB () {
+    # Round value to nearest 1 _iB.
+    local m
+    case $2 in
+        '') m=20 ;;  K) m=10 ;;  M) m=20 ;;  G) m=30 ;;  T) m=40
+    esac
+    echo $((($1+(1<<(m-1)))>>m))
+}
+
 to_be_added () {
 # Determine file space to be added while loading this image configuration.
 
@@ -2089,7 +2464,6 @@ to_be_added () {
 # the numeric result of du into the index zero position of var.  The index zero
 # value is the default operative value for the array variable when no other
 # indices are specified.
-#<<<<<<< Updated upstream
     if [[ -n $skipcompress ]] && [[ -s $SRCIMG ]]; then
         if mount -o loop,ro "$SRCIMG" $SRCMNT; then
             if [[ -s $SRCMNT/LiveOS/rootfs.img ]]; then
@@ -2111,7 +2485,6 @@ to_be_added () {
             to the target device."
             skipcompress=""
         fi
-#=======
 #    declare -ng rfs_v
 #    case $rfs_call in
 #        compress|embedded-fsimg|flat-sqfsimg)
@@ -2130,7 +2503,7 @@ to_be_added () {
 #            rfs_v=unsqfs
 #            f=unsqfs
 #    esac
-    [[ $tsc$rfs_call == @(''|clone) ]] && tsc=$ssc
+#    [[ $tsc$rfs_call == @(''|clone) ]] && tsc=$ssc
 #    echo $ssc$tsc
         # ssc is source structure code, tsc is target structure code
         # P=Partition E=Embedded X=eXpanded F=Flattened S=SqFS-partition
@@ -2138,196 +2511,319 @@ to_be_added () {
 #    if [[ $rfs_v${rfs_v[1]} == @(''|$IMGFS) ]] && [[ $ssc$tsc == @(XX|EE) ]]; then
 #        rfs_sz=($(du -b $SRCIMG))
 #        f=$ssc$tsc  # flag condition
-#>>>>>>> Stashed changes
     else
-        livesize=($(du -b "$SRCIMG"))
+        case $ssc$tsc in
+            PE)
+                [[ $mksqfs ]] || mksqfs[0]=$((rfs_sz+(${clone:+2+}2<<30))) ;&
+            [PX][EFS])
+                ((rfs_sz/=3))
+                ((rfs_sz+=rfs_sz>>3))   # 12.5 % larger
+                [[ $tsc == E ]] && {
+                    fsmaf ${mksqfs[1]}
+                    { [[ $ssc == X ]] && [[ ! $mksqfs ]] ;} && {
+                        s=($(du -b $SRCIMG))
+                        ((s[0]+=s[0]>>5))   # ~3.1 % larger
+                        ((s[0]+=s[0]>>m))
+                        mksqfs[0]=${s[0]} ;}
+                    # Account for metadata increase.
+                    ((rfs_sz+=rfs_sz>>m)) ;} ;;
+            [EFS][PX])
+                if [[ $ssc$tsc == EX ]] &&
+                    [[ $rfs_v${rfs_v[1]} == @(''|$IMGFS) ]]; then
+                    # flag condition
+                    f=$ssc$tsc
+                else
+                    fsmaf ${unsqfs[1]}
+                    if [[ $ssc == E ]]; then
+                        ((rfs_sz+=2<<30))
+                        ((rfs_sz+=rfs_sz>>5))   # ~3.1 % larger
+                    else
+                        ((rfs_sz*=4))
+                    fi
+                    ((rfs_sz+=rfs_sz>>m))
+                fi ;;
+            [PX][PX])
+                ((rfs_sz+=rfs_sz>>1))  # 50 % larger
+                [[ $rfspartition$tsc == P ]] && {
+                    rfspartition=$tsc
+                    [[ ${unsqfs[1]} ]] || unsqfs[1]=$IMGFS ;}
+                fsmaf ${unsqfs[1]}
+                ((rfs_sz+=rfs_sz>>m)) ;;
+            [EFS][EFS])
+                [[ $ssc == E ]] && rfs_sz=($(du -b $SRCIMG))
+                s=$(unsquashfs -stat $SRCIMG)
+                s=${s#*Compression }; s=${s%%$'\n'*}
+                # Allow extra space for zstd compression.
+                [[ $s == xz ]] && ((rfs_sz+=256<<20))
+                [[ $tsc == E ]] && {
+                    fsmaf ${mksqfs[1]}
+                    ((rfs_sz+=rfs_sz>>m))
+                    [[ $mksqfs ]] || mksqfs[0]=$((rfs_sz*4)) ;}
+                [[ $rfspartition$tsc == S ]] && rfspartition=squashfs
+        esac
+        [[ $clone ]] && ((rfs_sz+=rfs_sz>>3))  # + 12.5 % again
+#        echo $rfs_sz
     fi
-    if ((livesize >= 4<<30)) &&  [[ $TGTFS == @(vfat|msdos) ]]; then
-        echo "
-        An image size greater than 4096 MiB is not suitable for a 
-        VFAT-formatted partition.
-        "
-        if [[ -n $skipcompress ]]; then
-            echo " The compressed SquashFS will instead be copied
-            to the target device."
-            skipcompress=''
-            livesize=($(du -b "$SRCMNT/$srcdir/$squashimg"))
+    # Don't put end of data too close to end of partition.
+    ((rfs_sz%oio > 3<<20)) && ((rfs_sz+=1<<20))
+#    echo $rfs_sz
+    rfs_sz=$(((rfs_sz/oio+1)*oio))
+#    echo $rfs_sz
+    case $tsc in
+        [SPX])
+            [[ $f == @(EX|XX) ]] || {
+                [[ $rfs_v ]] || rfs_v[0]=$rfs_sz ;} ;;&
+        [SP])
+            rfs_ps=${rfs_v:-$rfs_sz}
+    esac
+    s=$((rfs_v-rfs_sz)); p=$rfs_sz
+    [[ $rfs_v != @(''|0|${!rfs_v}) ]] && ((s < 0)) && {
+            printf "\n     ALERT:     The requested \033[1m%s GiB\033[0m root \
+filesystem image size, may
+                be too small for the \033[1m%s of %s-GiB\033[0m source filesystem.
+                \033[1m%s GiB\033[0m of additional space is recommended.\n
+                Press Ctrl C to abort, or Enter to continue...\n
+            " $(_iB $rfs_v G) $(_iB k G) $(_iB p G) $(_iB -s G)
+            read ;}
+    [[ $rfs_ps ]] && rfs_sz=0
+    if [[ $TGTFS == @(vfat|msdos) ]] && ((rfs_sz >= 4<<30)); then
+        printf "
+        The filesystem image file size, %s MiB, is greater than the 4096 MiB
+        maximum for a VFAT-formatted partition." $(_iB rfs_sz)
+        if [[ $unsqfs ]]; then
+            printf "
+            The compressed SquashFS will instead be installed.\n\n"
+            unset -v 'unsqfs'
+            rfs_sz=($(du -b "$SRCMNT/$srcdir/$squashimg"))
             SRCIMG="$SRCMNT/$srcdir/$squashimg"
+            sleep 5
         else
             echo "Exiting..."
             exitclean
         fi
     fi
     local sources
-    if [[ -d $SRCMNT/$srcdir/syslinux ]]; then
-        sources+=" $SRCMNT/$srcdir/syslinux $SRCMNT/$srcdir/images"
+    if [[ $GRUBonly ]]; then
+        { [[ -d $SRCMNT/$srcdir/images ]] && s='' ;} || s='/..'
+        sources=" $SRCMNT/$srcdir${s:+$s}/boot $SRCMNT/$srcdir${s:+$s}/images"
+    elif [[ -d $SRCMNT/$srcdir/syslinux ]]; then
+        s=''
     else
-        sources+=" $SRCMNT/isolinux $SRCMNT/syslinux $SRCMNT/images"
+        s='/..'
+        sources=" $SRCMNT/$srcdir${s:+$s}/isolinux \
+               $SRCMNT/$srcdir${s:+$s}/syslinux $SRCMNT/$srcdir${s:+$s}/images"
     fi
-    [[ -n $EFI_BOOT ]] && sources+=" $SRCMNT$EFI_BOOT"
-    duTable=($(du -c -b "$0" $sources 2> /dev/null || :))
-    livesize=$((livesize + ${duTable[*]: -2:1}))
-    [[ -s $SRCHOME  && -n $copyhome ]] && copyhomesize=($(du -s -b $SRCHOME))
-    if [[ -s $SRCOVL && -n $copyoverlay ]]; then
+    [[ $EFI_BOOT ]] && sources+=" $SRCMNT/$srcdir/..$EFI_BOOT"
+    local duTable=($(du -c -b "$0" $sources 2> /dev/null || :))
+    livesz=$((rfs_sz + ${duTable[*]: -2:1}))
+    [[ -s $SRCHOME  && $copyhome ]] && copyhomesize=($(du -s -b $SRCHOME))
+    if [[ -s $SRCOVL && $copyoverlay ]]; then
         copyoverlaysize=($(du -c -b "$SRCOVL"))
         copyoverlaysize=${copyoverlaysize[*]: -2:1}
     fi
     tba=$((overlaysizeb + copyoverlaysize + homesizeb + copyhomesize +
-            livesize + swapsizeb))
+            livesz + swapsizeb))
 }
 
 to_be_added
 
-MiB () {
-    # Round value to nearest 1 MiB.
-    echo $((($1+(1<<19))>>20))
-}
+if [[ $flat_srcimg ]] && [[ $rfs_call != @(''|embedded-fsimg) ]]; then
+    if [[ ! $OverlayFS ]] && [[ ! $unsqfs ]] && [[ ! $nooverlay ]]; then
+        if [[ $mksqfs ]] && [[ $TGTFS == @(vfat|msdos) ]] &&
+            [[ ! $overlaysizeb ]]; then
+            IFS=: read -rs -n 1 -p "
+            ALERT:
+            The installation will have a flat FS structure that requires an
+            OverlayFS overlay specified by the --overlayfs option for data
+            persistence.
+
+            Because the target device filesystem has a '"$TGTFS"' format,
+            if you want data persistence, you must also specify the
+            --overlay-size-mb <size> options for an embedded OverlayFS.
+
+            Otherwise, the installation will use a temporary overlay on boot.
+            If you want a temporary overlay, press any key to continue,
+            otherwise, press <Esc> to exit.
+            " s
+            [[ $s == $'\e' ]] && exitclean 1
+        fi
+#        elif [[ -d $OVLPATH ]]; then
+#            OverlayFS=$TGTFS
+        if [[ ! $overlaysizeb$clone ]]; then
+            OverlayFS=temp
+        else
+            OverlayFS=$TGTFS
+        fi
+    elif [[ $overlaysizeb ]] && [[ $TGTFS != @(vfat|msdos) ]]; then
+        printf  "\n        Notice:
+        The source has a flat root filesystem structure that requires an
+        OverlayFS overlay for persistence.\n
+        Because the target device filesystem has an '"$TGTFS"' format, you need
+        NOT specify an --overlay-size-mb <size> value to hold an embedded
+        OverlayFS.\n
+            That option will be ignored...\n\n"
+        unset -v 'overlaysizeb'
+    fi
+fi
+#[[ $flat_srcimg == 2bflat_srcimg ]] && [[ $IMGFS == squashfs ]] &&
+#    unset -v 'flat_srcimg'
 
 checkDiskSpace () {
-    if [[ -n ${format[1]} ]]; then
+    if [[ ${format[1]} ]]; then
+#        set -xv
         # f2fs has greater relative overhead at smaller sizes.
-        ((m == 4)) && ((format < 2300<<20)) && m=3
+        [[ $TGTFS == f2fs ]] && ((format < 2300<<20)) && m=3
         # Filesystem metadata allowance
         local m=$((format>>m))
-        i=$((tba+m))
+#        printf "tba: $tba m: $m rfs_sz: $rfs_sz\n"
+        i=$((tba+m${rfspartition:+-${rfs_ps:?>>> Error: missing rfs_p size <<<}}))
         if ((free < 0 )); then
-            printf '\n  ALERT:
-            The requested primary partition size, %s MiB, is %s MiB larger than
-            the available free space on this device.\n' $(MiB format) $(MiB -free)
-            d=$((p2s+p3s))
-            ((d+free > 0)) && d="
-                The --noesp option will avoid the $(MiB d) MiB needed for the
-                EFI System Partition and Apple HFS+ partition.\n" && printf "$d"
-            printf "\n          Please adjust your request.\n"
+            [[ ${rfs_v[0]} ]] && s="
+            together with the root FS partition size, $(_iB rfs_ps G) GiB, are"
+            printf "\n\n      ALERT:
+            The requested primary partition size, %s MiB, ${s:-is}
+            %s MiB larger than the available free space on this device.\n" \
+                $(_iB format) $(_iB -free)
+            ((esps+free > 0)) && d="
+                The --noesp option will avoid the $(_iB d) MiB needed for the
+                EFI System Partition.\n" && printf "$d"
+            printf "\n            Please adjust your request.\n\n"
         fi
-        if ((format < i )); then
+        if ((format < i${rfspartition:+-${rfs_ps:-0}} )); then
             printf '\n  ALERT:
             The requested primary partition size, %s MiB, is %s MiB smaller
-            than the %s MiB installation space estimated for this image.\n
-            Please adjust your request.\n' $(MiB format) $(MiB i-format) $(MiB i)
+            than the %s of %s MiB installation space estimated for this image.\n
+            Consider adjusting your request.\n' $(_iB format) $(_iB i-format) \
+                                                $(_iB k) $(_iB i)
         fi
-        i=$format
-        available=$((format-tba-m))
+        #i=$((format+${rfspartition:-0}))
+        available=$((format-tba-m${rfspartition:++${rfs_ps:-0}}))
         if ((free < 0)); then
             available=$free
         fi
-        ((tba+=m+p2s+p3s+oio+z))
+        ((tba+=m+esps${rfspartition:++${rfs_psf:-0}}+oio+z))
         tbd=0
     else
+#        printf "avail: $available tba: $tba tbd: $tbd rfs_sz: $rfs_sz free: $free tds: $tds end: $end rfs_ps: $rfs_ps tze: $((tds-z-end))"
         free=$((available+tbd))
         ((available-=tba-tbd)) || :
+        if [[ $rfspartition ]]; then
+            [[ $multi ]] || {
+                FreeSpace=$rfs_ps
+                z=0
+            }
+            if (( FreeSpace-z < rfs_ps )); then
+            #if (( tds-z-end < rfs_ps )); then
+                printf '\n      ALERT:
+                The required %s partition size, %s MiB, is %s MiB larger
+                than the %s MiB of available space on this device.\n
+                Please reconsider your request.\n\n' ${unsqfs[1]} \
+                $(_iB rfs_ps) $(_iB end+rfs_ps-tds) $(_iB tds-z-end)
+                exitclean
+            fi
+            ((available+=rfs_ps))
+        fi
     fi
-    if ((available < 100<<20)) || ((free < 0)); then
+    if [[ $unsqfs && ! $flat_srcimg ]] || [[ $clone ]] ||
+            [[ $rfs_call == @(expand|compress|embedded-fsimg) ]]; then
+        TGTDIR=$(mktemp -d /run/tgtdir.XXXX)
+        f=$(findmnt -nbo AVAIL /run)
+        ((f-rfs_sz < 1<<20)) && rmdir $TGTDIR && TGTDIR=$TGTMNT/$LIVEOS &&
+            [[ $rfs_call == expand ]] && ((available-=rfs_sz))
+    fi
+    if ((available < 100<<20)) || ((free < 0)) || ([[ ${format[1]} ]] &&
+        ((format < i${rfspartition:+-${rfs_ps:-0}})) ); then
         local s t u
         if ((available < 0)); then
             s='may NOT fit in the space available on the target device.'
             t='fit the install and about 100  MiB
   of available space on the primary partition,'
-            u='   Approximate needed'
+            u='      Approximate need'
         else
             s='leave less than 100 MiB of available space on the primary partition.'
             t='leave about 100 MiB of available space on the primary partition,'
             u='Approximate available'
         fi
+        set +x
         printf "\n  The live image + overlay, home, & swap space, if requested,
         \r  %s\n\n" "$s"
-        [[ -n ${format[1]} ]] &&
-            printf "    Total disk space: %12s  MiB\n" $(MiB f) &&
-            printf "  + Allocated space: %13s  MiB\n" $(MiB i) ||
-            printf "    Available space: %13s  MiB\n" $(MiB free)
+        [[ ${format[1]} ]] &&
+            printf "    Total disk space: %12s  MiB\n" $(_iB tds) &&
+            printf "  - Allocated space: %13s  MiB\n" $(_iB i) ||
+            printf "    Available space: %13s  MiB\n" $(_iB free)
         if [[ ${format[1]} ]]; then
             ((format != free)) &&
-            printf "    Unallocated free space:  %5s\n" $(MiB $((free+z)))
+            printf "    Unallocated free space:  %5s\n" $(_iB $((free+z)))
         else
-            printf "    Free space shortage: %9s\n" $(MiB available)
+            printf "    Free space shortage: %9s\n" $(_iB available)
         fi
         printf "    ==============================\n"
-        printf "\r    Size of live image: %10s  MiB\n" $(MiB livesize)
-        [[ -n $overlaysizeb ]] &&
-            printf "    Overlay size: %16s\n" $(MiB overlaysizeb)
-        [[ -n $ovlsize ]] &&
-            printf "    Overlay size: %16s\n" $(MiB ovlsize)
-        [[ -n $copyoverlaysize ]] &&
-            printf "    Copy overlay size: %11s\n" $(MiB copyoverlaysize)
+        printf "\r    Size of live image: %10s  MiB\n" $(_iB livesz)
+        [[ $overlaysizeb ]] &&
+            printf "    Overlay size: %16s\n" $(_iB overlaysizeb)
+        [[ $ovlsize ]] &&
+            printf "    Overlay size: %16s\n" $(_iB ovlsize)
+        [[ $copyoverlaysize ]] &&
+            printf "    Copy overlay size: %11s\n" $(_iB copyoverlaysize)
         ((homesizeb > 0)) &&
-            printf "    Home filesystem size: %8s\n" $(MiB homesizeb)
-        [[ -n $copyhomesize ]] &&
-            printf '    Copy home filesystem size: %3s\n' $(MiB copyhomesize)
-        [[ -n $swapsizeb ]] &&
-            printf "    Swap file size: %14s\n" $(MiB swapsizeb)
-        if [[ -n ${format[1]} ]]; then
-            printf "    Metadata allowance: %10s\n" $(MiB m)
+            printf "    Home filesystem size: %8s\n" $(_iB homesizeb)
+        [[ $copyhomesize ]] &&
+            printf '    Copy home filesystem size: %3s\n' $(_iB copyhomesize)
+        [[ $swapsizeb ]] &&
+            printf "    Swap file size: %14s\n" $(_iB swapsizeb)
+        [[ $rfspartition ]] &&
+            printf "    Root FS partition: %11s\n"  $(_iB rfs_ps)
+        if [[ ${format[1]} ]]; then
+            printf "    Metadata allowance: %10s\n" $(_iB m)
             printf "    ==============================
-            \r    Primary Partition used: %6s\n" $(MiB $((format-available)))
-            printf "     %s:  %5s  MiB\n\n" "$u" $(MiB available)
-            [[ -n $p2s ]] &&
-            printf "    EFI System Partition: %8s\n" $(MiB p2s)
-            [[ -n $p3s ]] &&
-            printf "    Apple HFS+ Partition: %8s\n" $(MiB p3s)
-            printf "    Storage alignment gaps: %6s\n" $(MiB $((oio+z)))
+            \r    Primary Partition req'd: %5s\n" $(_iB $((format-available)))
+            printf "  -               requested: %5s\n" $(_iB format)
+            printf "  =  %s: %5s  MiB\n\n" "$u" $(_iB -available)
+            [[ $esps ]] &&
+            printf "    EFI System Partition: %8s\n" $(_iB esps)
+            printf "    Storage alignment gaps: %6s\n" $(_iB $((oio+z)))
         fi
         printf "    ==============================\n"
-        printf "  - Total required space:  %7s  MiB\n\n" $(MiB tba)
+        printf "  = Total required space:  %7s  MiB\n\n" $(_iB tba)
         printf "    ==============================\n"
         printf "\n  To %s
         \r  free space on the target, or adjust the
-        \r  requested size total by:  %6s  MiB\n\n" "$t" $(MiB $((available-(100<<20))))
+        \r  requested size total by:  %6s  MiB\n\n" "$t" $(_iB $((-available+(100<<20))))
+        set -x
         IFS=: read -n 1 -p "
   ATTENTION:
       Press Ctrl C to Exit.  ...To Continue anyway, press Enter.
 " s
         if [[ $s != '' ]]; then
-            losetup -d $l2 $l3 &> /dev/null || :
+            losetup -d $l2 &> /dev/null || :
             exitclean
         fi
     fi
 }
 
 # Format the device
-if [[ -n ${format[1]} && -z $skipcopy ]]; then
-    free=$(partSize $device)
-    f=$free
-    oio=$(lsblk -nrdo OPT-IO $device)
-    ((oio <= 512)) && ((oio=4<<20))
-    z=$((free%oio))
-    # Assure at least 2 MiB free space at the end of the disk.
-    ((z < 2<<20)) && ((z+=oio))
-    if [[ -z $noesp ]]; then
-        l2=$SRCMNT/images/efiboot.img
-        # Another possible path for the image.
-        ! [[ -f $l2 ]] && l2=$SRCMNT/isolinux/efiboot.img
-        if [[ -f $l2 ]]; then
-            l2=$(losetup --show -fr $l2)
-            p2s=$(partSize $l2)
-            if [[ $TGTFS == f2fs ]] && [[ $xa ]]; then
-                # When extra_attr or compression is requested for F2FS, or a
-                # GRUB EFI binary with the f2fs module is unavailable or cannot
-                # be produced, allow space for a UEFI executable, which can be
-                # produced by dracut --uefi, for use as an EFI Boot Stub.
-                # Allow 128 MiB per 15 GB of device_size for multi boot stubs.
-                ((free < 30*10**9)) && ((p2s+=1<<27)) ||
-                    ((p2s+=free/(15*10**9)<<27))
-            fi
-        else
-            # Force a 100 MB ESP partition
-            p2s=100*1024*1024
+if [[ ${format[1]} && ! $skipcopy ]]; then
+set -x
+    free=$tds
+    if [[ ! $noesp ]]; then
+        esps=($(du -s -b $SRCMNT/$srcdir/../EFI))
+        ((esps+=1<<20))     # Provide an extra mebibyte.
+        if [[ $TGTFS == f2fs ]] && [[ $xa ]]; then
+            # When extra_attr or compression is requested for F2FS, or a
+            # GRUB EFI binary with the f2fs module is unavailable or cannot
+            # be produced, allow space for a UEFI executable, which can be
+            # produced by dracut --uefi, for use as an EFI Boot Stub.
+            # Allow 128 MiB per 15 GB of device_size for multi boot stubs.
+            ((free < 30*10**9)) && ((esps+=1<<28)) ||
+                ((esps+=free/(15*10**9)<<27))
         fi
         # Guarantee that there is at least 1 MiB of extra space for a gap.
-        ((oio-p2s%oio < 1<<20)) && ((p2s+=1<<20))
-        # Set partition size to whole 4-MiB or OPT-IO units.
-        ((p2s=(p2s/oio+1)*oio))
-
-        if [[ -z $nomac ]]; then
-            l3=$SRCMNT/images/macboot.img
-            ! [[ -f $l3 ]] && l3=$SRCMNT/isolinux/macboot.img
-            if [[ -f $l3 ]]; then
-                l3=$(losetup --show -fr $l3)
-                ((p3s=($(partSize $l3)/oio+1)*oio))
-            fi
-        fi
+        ((oio-esps%oio < 1<<20)) && [[ $rfspartition ]] && ((esps+=1<<20))
+        # Set partition size to whole 4-MiB or oio units.
+        ((esps=(esps/oio+1)*oio))
     fi
-    ((free-=oio+z+p2s+p3s))
-    if [[ -z $format ]]; then
+    ((free-=oio+z+esps${rfspartition:++${rfs_ps:-0}}))
+    if [[ $format == @(''|0|format) ]]; then
         # unspecified partition size case
         format=$free
     else
@@ -2336,27 +2832,23 @@ if [[ -n ${format[1]} && -z $skipcopy ]]; then
     # Reduce to OPT-IO units.
     ((format/=oio,format*=oio))
     checkDiskSpace
-    printf '\n    WARNING: The requested formatting will DESTROY ALL DATA
-             on: %s !!\n
-      Press Enter to continue, or Ctrl C to abort.\n' $device
-    read
+    [[ ! $force ]] && IFS=: read -rs -n 1 -p "
+    WARNING: The requested formatting will DESTROY ALL DATA
+             on $device !!
+
+        Press any key to continue, or Escape to abort.
+        " s || s=1
+    if [[ $s == $'\e' ]]; then
+            echo -e "       aborting... "
+        exitclean 1
+    fi
     umount ${device}* &> /dev/null || :
     wipefs -af ${device} &> /dev/null
 
     createFSLayout $device
-    resetMBR
+    [[ $GRUBonly ]] || resetmbr=resetmbr
 fi
-
-if [[ -n $efi ]] || [[ gpt == $(lsblk -ndro PTTYPE $TGTDEV) ]]; then
-    checkGPT
-else
-# Because we can't set boot flag for EFI Protective on msdos partition tables.
-    checkPartActive $TGTDEV
-fi
-
-[[ $resetmbr ]] && resetMBR
-
-checkMBR
+checkPartitioning
 
 fs_label_msg() {
     case $TGTFS in
@@ -2383,47 +2875,45 @@ fs_label_msg() {
     exitclean
 }
 
-labelTargetDevice() {
-    local dev=$1
-    TGTLABEL=$(get_label $dev)
-    TGTLABEL=${TGTLABEL//[[:space:]]/_}
-    [[ -z $TGTLABEL && -z $label ]] && label=LIVE
-    if [[ -n $label && $TGTLABEL != "$label" ]]; then
-        case $TGTFS in
-            vfat|msdos)
-                fatlabel $dev "$label"
-                ;;
-            ext[432])
-                e2label $dev "$label"
-                ;;
-            btrfs)
-                btrfs filesystem label $dev "$label"
-                ;;
-            xfs)
-                xfs_admin -L "$label" $dev
-                ;;
-            f2fs)
-                printf '
-                ALERT:  F2FS labels are set at creation time.\n'
-                ;;
-            * )
-                printf "
-                ALERT:  Unknown filesystem type.
-                Try setting its label to '$label' and re-running.\n"
-                exitclean
-        esac
-        TGTLABEL="$label"
-    fi
-    label=$TGTLABEL
-}
-
-labelTargetDevice $TGTDEV
+TGTLABEL=$(get_label $TGTPT)
+TGTLABEL=${TGTLABEL//[[:space:]]/_}
+[[ ! $TGTLABEL && ! $label ]] && label=LIVE
+label=${label//[[:space:]]/_}
+if [[ $label && $TGTLABEL != $label ]]; then
+    umount $TGTMNT || :
+    case $TGTFS in
+        vfat|msdos)
+            fatlabel $TGTPT "$label"
+            ;;
+        ext[432])
+            e2label $TGTPT "$label"
+            ;;
+        btrfs)
+            btrfs filesystem label $TGTPT "$label"
+            ;;
+        xfs)
+            xfs_admin -L "$label" $TGTPT
+            ;;
+        f2fs)
+            printf '
+            ALERT:  F2FS labels are set at creation time.\n'
+            ;;
+        * )
+            printf "
+            ALERT:  Unknown filesystem type.
+            Try setting its label to '$label' and re-running.\n"
+            exitclean
+    esac
+    TGTLABEL="$label"
+    mount $tgtmountops $TGTPT $TGTMNT || exitclean
+fi
+label=$TGTLABEL
 
 # Use UUID if available.
-TGTUUID=$(blkid -s UUID -o value $TGTDEV)
-if [[ -n $TGTUUID ]]; then
+TGTUUID=($(lsblk -rno UUID $TGTPT))
+if [[ $TGTUUID ]]; then
     TGTLABEL=UUID=$TGTUUID
-elif [[ -n $TGTLABEL ]]; then
+elif [[ $TGTLABEL ]]; then
     # Escape any special characters \/;& for sed replacement strings.
     TGTLABEL="LABEL=$(sed 's/[\/;&]/\\&/g' <<< $TGTLABEL)"
 else
@@ -2432,46 +2922,64 @@ else
     UUID for your target device.\n'
     fs_label_msg
 fi
-OVLNAME="overlay-$label-$TGTUUID"
 
 if [[ ${format[1]} ]]; then
-    mount $tgtmountopts $TGTDEV $TGTMNT || exitclean
+    mount $tgtmountops $TGTPT $TGTMNT || exitclean
     T_EFI_BOOT=$EFI_BOOT
 fi
-# Use compound array assignment in case there are multiple files.
-BOOTCONFIG_EFI=($(nocase_path "$TGTMNT$T_EFI_BOOT/boot*.conf"))
 
-# Detect any pre-existing, subsequent or non-default installation directories.
-multidirs=($(ls -1d $TGTMNT/*/syslinux 2>/dev/null || :))
-if [[ -n $multidirs ]]; then
-    multidirs=(${multidirs[@]%/syslinux})
-    multidirs=(${multidirs[@]##*/})
+if [[ $skipcopy ]] && [[ ! -s ${TGTMNT}${multi:+/$multi}/images ]]; then
+    printf '\n    ATTENTION:
+    The /images/ directory is missing on this target installation.
+    Exiting...\n\n'
+    exitclean
 fi
 
-# Identify the initial installation directory name.
+# Use compound array assignment in case there are multiple files.
+#GRUB_CFG=($(nocase_path "$TGTMNT$T_EFI_BOOT/boot*.conf"))
+GRUB_CFG=($(nocase_path "$TGTMNT$T_EFI_BOOT/grub.cfg"))
+#[[ ! -d $TGTMNT$T_EFI_BOOT ]] && mkdir -p $TGTMNT$T_EFI_BOOT
+
+# Detect any pre-existing, subsequent or non-default installation directories.
+multidirs=($(ls -1d $TGTMNT/*/images 2>/dev/null || :))
+if [[ $multidirs ]]; then
+    multidirs=(${multidirs[@]%/images})
+    multidirs=(${multidirs[@]##*/})
+fi
+    # Identify the initial installation directory name.
 [[ -f $TGTMNT/syslinux/$CONFIG_FILE ]] &&
 _1stindir=$(sed -n -r '/^\s*label\s+linux/I {n;n;n
                        s/^\s*append\s+.*rd\.live\.dir=(\S+)( .*|$)/\1/Ip}
                       ' $TGTMNT/syslinux/$CONFIG_FILE)
-[[ -z $_1stindir ]] && _1stindir=LiveOS
-# Special case for the reconfiguration of a non-default initial installation
-# directory.
-[[ -n $skipcopy && $LIVEOS == LiveOS ]] && LIVEOS=$_1stindir
-
-# $multi signals the current installation directory as a subsequent one.
-if [[ -n $multi ]]; then
-    if ! [[ -e $TGTMNT/syslinux ]]; then
-        unset -v multi
-    elif [[ $LIVEOS == $_1stindir ]] && [[ -z $force ]]; then
-        IFS=: read -p '
+[[ -f $TGTMNT/boot/grub2/grub.cfg ]] &&
+_1stindir=$(sed -n -r '0,/^\s*linuxefi/ {
+                    s/^\s*linuxefi\s+\\images.*rd\.live\.dir=(\S+)( .*|$)/\1/p}
+                      ' $GRUB_CFG)
+[[ $_1stindir ]] || _1stindir=LiveOS
+    # Reconfiguration of a non-default initial installation directory.
+[[ $skipcopy && $LIVEOS == LiveOS ]] && LIVEOS=$_1stindir
+    # $multi signals the current installation directory as a subsequent one
+    # & holds the parent directory for the image's syslinux & images directory.
+#    || [[ $(sed -n -r '0,/^\s*linux/ {
+#                       s/^\s*linux.*root=live:CDLABEL=(\S+)( .*|$)/\1/p}
+#                      ' $SRCMNT/boot/grub2/grub.cfg) ]]
+if [[ $multi ]]; then
+    if ! [[ -d $TGTMNT/images ]]; then
+        unset -v 'multi'
+    elif [[ $LIVEOS == $_1stindir ]]; then
+        if [[ $force ]]; then
+            LIVEOS=${LIVEOS}_2
+        else
+            IFS=: read -p '
     Please designate a directory name
       for this multi boot installation: ' LIVEOS
+        fi
         if [[ $LIVEOS =~ [[:space:]]|/ ]]; then
             printf "\n    ALERT:
     The LiveOS directory name, '%s', contains spaces, newlines,
     tabs, or '/'.
 
-    Whitespace and '/' do not work with the SYSLINUX boot loader.\n
+    Whitespace and '/' are undesirable characters for a directory name.\n
     Replacing the whitespace by underscores, any '/' by '-':  " "$LIVEOS"
             LIVEOS=${LIVEOS//[[:space:]]/_}
             LIVEOS=${LIVEOS////-}
@@ -2481,29 +2989,41 @@ if [[ -n $multi ]]; then
     multi=$LIVEOS
 fi
 
-if [[ -e $TGTMNT/syslinux ]] && [[ -z $skipcopy ]] &&
-   [[ -z $multi && -z $force ]]; then
-    if [[ $srctype == @(netinst|installer) ]]; then
-        d='the /images & boot configuration
-                directories'
-    else
-        d="any image in the '$LIVEOS'
-                directory"
-    fi
-    IFS=: read -n 1 -p "
-    ATTENTION:
+if [[ -d $TGTMNT/images ]] && [[ ! $multi ]]; then
+    m="    ATTENTION:
 
         >> There may be other LiveOS images on this device. <<
 
     Do you want a new Multi Live Image installation?
 
-        If so, press 'Enter' to continue.
+        If so, press 'Enter' to continue."
+    k='
 
-        Or, press the [space bar], and $d will be overwritten,
-                and any others ignored.
+        Or, press the [space bar], and '
+
+    if [[ $srctype == @(netinst|installer) ]]; then
+        m=$m$k'the /images & boot configuration
+                directories will be overwritten,
+                and any others ignored.'
+    else
+        m=$m$k"any image in the '$LIVEOS'
+                directory will be overwritten,
+                and any others ignored."
+    fi
+    [[ $clone ]] && m=$m$k"any image in the '$LIVEOS'
+                directory will be updated,
+                any others will be ignored."
+    [[ $skipcopy ]] && m="    Press the [space bar], and
+        the '$LIVEOS' boot configuration will be updated."
+    if [[ $force ]]; then
+        multi=''
+    else
+        IFS=: read -n 1 -p "$m
 
     To abort the installation, press Ctrl C.
     " multi
+    fi
+    [[ $skipcopy && ! $multi ]] && multi=' '
     if [[ $multi != ' ' ]]; then
         if [[ $LIVEOS == $_1stindir ]] || [[ ${multidirs[@]} =~ $LIVEOS ]]; then
             LIVEOS=$(mktemp -d $TGTMNT/XXXX)
@@ -2511,39 +3031,55 @@ if [[ -e $TGTMNT/syslinux ]] && [[ -z $skipcopy ]] &&
             LIVEOS=${LIVEOS##*/}
         fi
         multi=$LIVEOS
-    elif [[ -z $multidirs ]] && [[ $_1stindir == $LIVEOS ]]; then
-        unset -v multi
+    elif [[ ! $multidirs ]] && [[ $_1stindir == $LIVEOS ]]; then
+        unset -v 'multi'
+    elif [[ $LIVEOS == LiveOS ]]; then
+        unset -v 'multi'
     else
         multi=$LIVEOS
     fi
 fi
-if [[ $(syslinux --version 2>&1) != syslinux\ * ]]; then
-    # Older versions lacking the --version option install in the root.
-    SYSLINUXPATH=''
-    if [[ -n $multi ]]; then
-        printf '\n        ERROR:
-        This version of SYSLINUX does not support multi boot.\n
-        Please upgrade.  Exiting...\n\n'
-        exitclean
-    fi
-elif [[ ! -d $TGTMNT/syslinux ]] ||
-    # Case of reconfiguring a nondefault --livedir initial installation.
-    [[ -d $TGTMNT/$LIVEOS && ! -d $TGTMNT/$LIVEOS/syslinux ]]; then
-    SYSLINUXPATH=syslinux
+OVLNAME="overlay-$label-$TGTUUID"
+OVLPATH=$TGTMNT/$LIVEOS/$OVLNAME
+_OVLPATH=${TGTLABEL}
+
+SLNX_CFG=''
+if [[ $GRUBonly ]]; then
+    :
+elif [[ -f $TGTMNT/boot/grub2/grub.cfg ]]; then
+    # Once a device has a GRUBonly install, SYSLINUX booting will be abandoned
+    # for it.
+    rmSYSLINUX=rmSYSLINUX  # [[ ! $GRUBonly && ! $SLNX_CFG ]]
 else
-    SYSLINUXPATH=$LIVEOS/syslinux
+    if [[ $(syslinux --version 2>&1) != syslinux\ * ]]; then
+        # Older versions lacking the --version option install in the root.
+        SYSLINUXPATH='/'
+        if [[ $multi || $multidirs ]]; then
+            printf '\n        ERROR:
+            This version of SYSLINUX does not support multi boot.\n
+            Please upgrade.  Exiting...\n\n'
+            exitclean
+        fi
+    elif [[ ! -d $TGTMNT/syslinux ]] ||
+        # Case of reconfiguring a nondefault --livedir initial installation.
+        [[ -d $TGTMNT/$LIVEOS && ! -d $TGTMNT/$LIVEOS/syslinux ]]; then
+        SYSLINUXPATH=/syslinux
+    else
+        SYSLINUXPATH=/$LIVEOS/syslinux
+    fi
+    SLNX_CFG=$TGTMNT$SYSLINUXPATH/isolinux.cfg
+    # No GRUBonly installations on device.
 fi
 
 # Backup previous config_files.
 [[ -f $TGTMNT/syslinux/$CONFIG_FILE ]] &&
-    cp $TGTMNT/syslinux/$CONFIG_FILE $TGTMNT/syslinux/$CONFIG_FILE.prev
+    cp -p $TGTMNT/syslinux/$CONFIG_FILE $TGTMNT/syslinux/$CONFIG_FILE.prev
 [[ -f $TGTMNT$T_EFI_BOOT/grub.cfg ]] &&
-    cp $TGTMNT$T_EFI_BOOT/grub.cfg $TGTMNT$T_EFI_BOOT/grub.cfg.prev
-[[ -f $BOOTCONFIG_EFI ]] &&
-    cp $BOOTCONFIG_EFI $BOOTCONFIG_EFI.prev
+    cp -p $TGTMNT$T_EFI_BOOT/grub.cfg $TGTMNT$T_EFI_BOOT/grub.cfg.prev
+#[[ -f $GRUB_CFG ]] &&
+#    cp -p $GRUB_CFG $GRUB_CFG.prev
 
-OVLPATH=$TGTMNT/$LIVEOS/$OVLNAME
-if [[ -n $resetoverlay ]]; then
+if [[ $resetoverlay ]]; then
     existing=($(find $TGTMNT/$LIVEOS/ -name overlay-* -print || :))
     if [[ ! -s $existing ]]; then
         printf '\n        NOTICE:
@@ -2553,13 +3089,13 @@ if [[ -n $resetoverlay ]]; then
         resetoverlay=''
     fi
 fi
-if [[ -n $resetoverlay ]]; then
-    if [[ -n $overlaysizeb && -z $skipcopy ]]; then
+if [[ $resetoverlay ]]; then
+    if [[ $overlaysizeb && ! $skipcopy ]]; then
         printf '\n        ERROR:
         You requested a new persistent overlay AND to reset the current one.\n
         Please select only one of these options.  Exiting...\n\n'
         exitclean
-    elif [[ -n $copyoverlay && -z $skipcopy ]]; then
+    elif [[ $copyoverlay && ! $skipcopy ]]; then
         printf '\n        ERROR:
         You asked to reset the target overlay AND to copy the source one.\n
         Please select only one of these options.  Exiting...\n\n'
@@ -2572,7 +3108,7 @@ fi
 
 HOMEPATH=$TGTMNT/$LIVEOS/$HOMEFILE
 SRCHOME=$SRCMNT/$srcdir/$HOMEFILE
-if [[ -z $skipcopy && -f $HOMEPATH && -n $keephome && -n $homesizeb ]]; then
+if [[ ! $skipcopy && -f $HOMEPATH && $keephome && $homesizeb ]]; then
     printf '\n        ERROR:
         The target has an existing home.img file and you requested that a new
         home.img be created.  To remove an existing home.img on the target,
@@ -2580,8 +3116,8 @@ if [[ -z $skipcopy && -f $HOMEPATH && -n $keephome && -n $homesizeb ]]; then
         Please adjust your home.img options.  Exiting...\n\n'
     exitclean
 fi
-if [[ -z $skipcopy && -f $HOMEPATH && -n $keephome &&
-      -n $copyhome && -s $SRCHOME ]]; then
+if [[ ! $skipcopy && -f $HOMEPATH && $keephome &&
+        $copyhome && -s $SRCHOME ]]; then
     printf '\n        ERROR:
         The target has an existing home.img, and you requested that one from
         the source be copied to the target device.
@@ -2590,13 +3126,13 @@ if [[ -z $skipcopy && -f $HOMEPATH && -n $keephome &&
         Please adjust your home options.  Exiting...\n'
     exitclean
 fi
-if [[ ! -f $SRCHOME && -n $copyhome ]]; then
+if [[ ! -f $SRCHOME && $copyhome ]]; then
     printf '\n        ERROR:
         There appears to be no persistent /home.img on the source.
         Please check your inputs.  Exiting...\n'
     exitclean
 fi
-if [[ $SRCFS == iso9660 && -f $SRCHOME && -z $copyhome ]]; then
+if [[ $SRCFS == iso9660 && -f $SRCHOME && ! $copyhome ]]; then
     printf '\n        NOTICE:
         The source has a persistent home.img intended for installation.
         If there is an existing home.img on the target device,
@@ -2605,7 +3141,7 @@ if [[ $SRCFS == iso9660 && -f $SRCHOME && -z $copyhome ]]; then
     read
     copyhome=1
 fi
-if [[ -f $SRCHOME && -n $copyhome && -n $cryptedhome ]]; then
+if [[ -f $SRCHOME && $copyhome && $cryptedhome ]]; then
     printf '\n        ATTENTION:
         The default --encrypted-home option is only available for newly-created
         home.img filesystems.  If the home.img on the source is encrypted,
@@ -2613,14 +3149,14 @@ if [[ -f $SRCHOME && -n $copyhome && -n $cryptedhome ]]; then
         Press Enter to continue, or Ctrl C to abort.\n'
     read
 fi
-if [[ -s $SRCHOME && -n $copyhome && -n $homesizeb ]]; then
+if [[ -s $SRCHOME && $copyhome && $homesizeb ]]; then
     printf '\n        ERROR:
         You requested a new home AND to copy one from the source.\n
         Please request only one of these options.  Exiting...\n'
     exitclean
 fi
-if [[ ! -s $SRCHOME && -n $copyhome ]] &&
-    [[ -n $overlaysizeb || -n $resetoverlay || -n $copyoverlay ]]; then
+if [[ ! -s $SRCHOME && $copyhome ]] &&
+    [[ $overlaysizeb || $resetoverlay || $copyoverlay ]]; then
     printf '\n        NOTICE:
         There appears to be no persistent home.img on this source.\n
         Would you LIKE to continue with just the persistent overlay?\n
@@ -2631,42 +3167,15 @@ fi
 
 thisScriptpath=$(readlink -f "$0")
 
-to_be_deleted() {
-# Determine the file space to be deleted from the target device.
-
-    if [[ -d $TGTMNT/$LIVEOS && -z $format ]]; then
-        # du -c reports a grand total in the first column of the last row,
-        # i.e., at ${array[*]: -2:1}, the penultimate index position.
-        tbd=($(du -c -b $TGTMNT/$LIVEOS 2> /dev/null || :))
-        tbd=${tbd[*]: -2:1}
-        if [[ -s $HOMEPATH ]] && [[ -n $keephome ]]; then
-            homesize=($(du -b $HOMEPATH))
-            tbd=$((tbd - homesize))
-        fi
-        if [[ -s $OVLPATH ]] && [[ -n $resetoverlay ]]; then
-            ovlsize=($(du -c -b $OVLPATH))
-            ovlsize=${ovlsize[*]: -2:1}
-            tbd=$((tbd - ovlsize))
-        fi
-    else
-        tbd=0
-    fi
-
-    targets="$TGTMNT/$SYSLINUXPATH"
-    [[ -n $T_EFI_BOOT ]] && targets+=" $TGTMNT$T_EFI_BOOT "
-    [[ -n $xo ]] && targets+=$TGTMNT/boot/olpc.fth
-    duTable=($(du -c -b $targets 2> /dev/null || :))
-    tbd=$((tbd + ${duTable[*]: -2:1}))
-
-    [[ -z ${format[1]} ]] && checkDiskSpace || :
-}
-
-if [[ -z ${format[1]} ]]; then
-    available=($(df -B 1 $TGTMNT))
-    available=${available[*]: -3:1}
+if [[ ! ${format[1]} ]]; then
+    case $tsc in
+        P)
+            available=$FreeSpace ;;
+        *)
+            available=($(df -B 1 $TGTMNT))
+            available=${available[*]: -3:1}
+    esac
 fi
-
-[[ -z $skipcopy && live == $srctype ]] && to_be_deleted
 
 # Verify available space for DVD installer
 if [[ $srctype == installer ]]; then
@@ -2696,8 +3205,44 @@ if [[ $srctype == installer ]]; then
     fi
 fi
 
-if [[ $srctype == live && -d $TGTMNT/$LIVEOS ]]; then
-    if [[ ! -d $TGTMNT/$LIVEOS/syslinux ]]; then
+if [[ ${format[1]}$skipcopy$srctype == @(live|clone) ]]; then
+    # Determine the file space to be deleted from the target device.
+    if [[ -d $TGTMNT/$LIVEOS && ! $format ]]; then
+        # du -c reports a grand total in the first column of the last row,
+        # i.e., at ${array[*]: -2:1}, the penultimate index position.
+        d=($(du -c -b $TGTMNT/$LIVEOS 2> /dev/null || :))
+        tbd=${d[*]: -2:1}
+        if [[ -s $HOMEPATH ]] && [[ $keephome ]]; then
+            d=($(du -b $HOMEPATH))
+            tbd=$((tbd - d))
+        fi
+        if [[ -s $OVLPATH ]] && [[ $resetoverlay ]]; then
+            d=($(du -c -b $OVLPATH))
+            ovlsize=${d[*]: -2:1}
+            tbd=$((tbd - ovlsize))
+        fi
+        if [[ $rfspartition ]]; then
+            tbd=$((tbd + p4s))
+        fi
+    else
+        tbd=0
+    fi
+
+    s=''
+    [[ $SLNX_CFG ]] && s=${SYSLINUXPATH:+$TGTMNT$SYSLINUXPATH}
+    [[ $rmSYSLINUX ]] && s+=" ${SYSLINUXPATH:+$TGTMNT$SYSLINUXPATH}
+        $(ls -1d $TGTMNT/*/syslinux 2>/dev/null || :)"
+    [[ $T_EFI_BOOT ]] && s+=" $TGTMNT$T_EFI_BOOT"
+    [[ $xo ]] && s+=" $TGTMNT/boot/olpc.fth"
+    d=($(du -c -b $s 2> /dev/null || :))
+    tbd=$((tbd + ${d[*]: -2:1}))
+fi
+
+if ! [[ $srctype == @(live|clone) && -d $TGTMNT/$LIVEOS ]]; then
+    ! [[ ${format[1]} ]] && checkDiskSpace
+else
+    if [[ $SLNX_CFG ]] && [[ ! -d $TGTMNT/$LIVEOS/syslinux ]] &&
+        [[ -s $TGTMNT/syslinux/$CONFIG_FILE ]]; then
         # When operating on a pre-existing, initial installation directory,
         # save any multi menus for later configuration.
         MENUS=$(sed -n -r '/^\s*label .*/I {
@@ -2705,76 +3250,271 @@ if [[ $srctype == live && -d $TGTMNT/$LIVEOS ]]; then
                /\<kernel\s+[^ ]*menu.c32\>/p};}' $TGTMNT/syslinux/$CONFIG_FILE)
         MENUS=$(sed 's/.*/&\\/'  <<< "$MENUS")$'\n'
     fi
-    if [[ -z $skipcopy ]]; then
+    if ! [[ $skipcopy ]] && ! [[ $clone ]]; then
+        # Check for an associated partition
+        for i in squashfs rootfs; do
+            if [[ -b $TGTMNT/$LIVEOS/$i.img ]]; then
+                rfs_p=$(realpath "$TGTMNT/$LIVEOS/$i.img")
+                break
+            else
+                rfs_p=''
+            fi
+        done
+        if [[ $rfspartition ]]; then
+            PARTUUID=$(lsblk -rno PARTUUID $rfs_p)
+            ((tds+=rfs_ps))
+        elif [[ $rfs_p ]]; then
+            PARTUUID=remove
+        fi
+        checkDiskSpace # [[ ! ${format[1]} ]] && 
         case $force in
         '')
           printf "\nThe '%s' directory is already set up with a LiveOS image.\n
-                 " $LIVEOS
-          if [[ -z $keephome ]] && [[ -e $HOMEPATH ]]; then
+It will automatically be deleted after a 15-second countdown.\n" $LIVEOS
+          sleep 2
+          if [[ -e $HOMEPATH ]] && [[ ! $keephome ]]; then
               printf '\n        WARNING:
               \r        The old persistent home.img will be deleted!!!\n
               \r        Press Enter to continue, or Ctrl C to abort.'
               read
-          else
-              printf '    Press Ctrl C if you wish to abort.
-                  Deleting the old OS in     seconds.\b\b\b\b\b\b\b\b\b\b'
-              for (( i=14; i>=0; i=i-1 )); do
-                printf '\b\b%02d' $i
-                sleep 1
-              done
-              [[ -e $HOMEPATH && -n $keephome ]] &&
-                mv $HOMEPATH $TGTMNT/$HOMEFILE
-              [[ -e $OVLPATH && -n $resetoverlay ]] &&
-                mv $OVLPATH $TGTMNT/$OVLNAME
-          fi ;&
+          fi
+          printf '    Press Ctrl C if you wish to abort.
+              Deleting the old OS in     seconds.\b\b\b\b\b\b\b\b\b\b'
+          for (( i=14; i>=0; i=i-1 )); do
+            printf '\b\b%02d' $i
+            sleep 1
+          done
+          [[ -e $HOMEPATH && $keephome ]] &&
+            mv $HOMEPATH $TGTMNT/$HOMEFILE
+          [[ -e $OVLPATH && $resetoverlay ]] &&
+            mv $OVLPATH $TGTMNT/$OVLNAME
+          ;&
              # The ;& terminator causes case to also execute the next block
              # without testing its pattern.
         force)
-          rm -rf -- $TGTMNT/$LIVEOS
+          rm -rf --one-file-system -- $TGTMNT/$LIVEOS
+          [[ $PARTUUID == remove ]] && run_parted $device rm ${rfs_p##*[[:alpha:]]}
         esac
     fi
 fi
 
+if [[ ${format[1]}$skipcopy$srctype == @(live|clone) ]]; then
+    # $rfs_p holds previous SquashFS root partition for the livedir install.
+    [[ $rfspartition ]] && [[ ! -b $rfs_p ]] && partitionrfs
+fi
+
 # Live image copy
-if [[ $srctype == live && -z $skipcopy ]]; then
+if [[ $srctype == @(live|clone) && ! $skipcopy ]]; then
     printf '\nCopying LiveOS image to target device...\n'
     [[ ! -d $TGTMNT/$LIVEOS ]] && mkdir $TGTMNT/$LIVEOS
-    [[ -n $keephome && -f $TGTMNT/$HOMEFILE ]] &&
+    [[ $keephome && -f $TGTMNT/$HOMEFILE ]] &&
         mv $TGTMNT/$HOMEFILE $HOMEPATH
-    [[ -n $resetoverlay && -e $TGTMNT/$OVLNAME ]] &&
+    [[ $resetoverlay && -e $TGTMNT/$OVLNAME ]] &&
         mv $TGTMNT/$OVLNAME $OVLPATH
-    if [[ -n $skipcompress && -f $SRCMNT/$srcdir/$squashimg ]]; then
-        mount -o loop,ro "$SRCMNT/$srcdir/$squashimg" $SRCMNT || exitclean
-        $copyFile "$SRCIMG" $TGTMNT/$LIVEOS/rootfs.img || {
-            umount $SRCMNT ; exitclean ; }
-        umount $SRCMNT
-    elif [[ -f $SRCIMG ]]; then
+    [[ $RFSwasMounted ]] || { mount -r $SRCIMG $IMGMNT || exitclean
+        if [[ $SRCIMG != $RFSIMG ]]; then
+            [[ -d $RFSIMG ]] && op=--bind
+            mount -r ${op:+$op} $RFSIMG $IMGMNT || exitclean
+        fi ;}
+    if [[ $ssc$tsc == EX ]] && [[ ${rfs_v[1]} == @(''|$IMGFS) ]] &&
+        [[ ! $rfs_v ]]; then
+        umount $IMGMNT
+        $copyFile "$RFSIMG" $TGTMNT/$LIVEOS/${RFSIMG##/*/} || exitclean
+        f=done
+        printf '\nNow checking the copied filesystem on the target device...\n'
+        fscheck $IMGFS $TGTMNT/$LIVEOS/${RFSIMG##/*/}
+    elif [[ $ssc$tsc == XE ]] && [[ ${mksqfs[1]} == $IMGFS ]]; then
+        mkdir $TGTDIR/LiveOS
+        touch $TGTDIR/LiveOS/rootfs.img
+        umount $IMGMNT
+        mount -r --bind $RFSIMG $TGTDIR/LiveOS/rootfs.img
+        ops='-comp zstd -b 1M -no-recovery -not-reproducible -noappend'\
+' -keep-as-directory'
+        mksquashfs $TGTDIR/LiveOS $TGTMNT/$LIVEOS/squashfs.img $ops
+        umount $TGTDIR/LiveOS/rootfs.img
+        rm -rf --one-file-system -- $TGTDIR
+        f=done
+    elif [[ $ssc$tsc == @(FF|XX|EE) ]] && [[ ! $rfs_v ]]; then
+        f=notdone
+        unset -v 'clone'
+    elif [[ $tsc == [FSEXP] ]]; then
+        if [[ $clone ]]; then
+            touch /.liveimg-configured /.liveimg-late-configured
+            echo -e "$(date +%Y%b%d~%H:%M)_$builder-remix
+$(</usr/lib/fedora-release)" >/usr/lib/fedora-release
+            sync -f /
+        fi
+        if { [[ $unsqfs ]] ||
+                [[ $rfs_call == @(expand|compress|embedded-fsimg) ]] ||
+                [[ $flat_srcimg && $IMGFS == squashfs && $unsqfs ]];} then
+            case $rfs_call in
+                compress|embedded-fsimg)
+                    mkdir $TGTDIR/LiveOS
+                    i=$TGTDIR/LiveOS/rootfs.img
+                    fsloop=$i
+                    ;;
+                *)
+                    if [[ $rfspartition ]]; then
+                        i=$rfs_p
+                        # Make rootfs.img to point to the Root FS partition.
+                        ln -s /dev/disk/by-partuuid/$PARTUUID \
+                              $TGTMNT/$LIVEOS/rootfs.img
+                    else
+                        i=$TGTMNT/$LIVEOS/rootfs.img
+                    fi
+            esac
+            tgtdir=$(mktemp -d /tmp/tmpmnt.XXXX)
+            # Flattened squashfs or new fstype or size -> uncompressed img
+            mkfs_config partition ROOTFS ${!rfs_v} $i
+            umount $i >/dev/null 2>&1 || :
+            flock $i $mkfs $ops
+            [[ ${rfs_v[1]} == ext[432] ]] && tune2fs -c0 -i0 -ouser_xattr,acl $i
+            fscheck ${rfs_v[1]} $i
+            if [[ -f $i ]]; then
+                [[ $fsloop ]] || fsloop=$TGTMNT/$LIVEOS/rootfs.img
+                i=$fsloop
+            fi
+            mount ${tgtmountops:+$tgtmountops} $i $tgtdir || exitclean
+            case $ssc$tsc in
+                [EXP][EXP])
+                    case $clone in clone) s=cloning ;; *) s=copying ; esac
+                    printf "\nNow %s image to an expanded %s filesystem.
+                       Please wait..." $s ${rfs_v[1]}
+                    if [[ $ssc == [XP] ]]; then
+                        cat <<'EOF' >/tmp/ef
+/etc/machine-id
+/var/lib/dbus/machine-id
+EOF
+                        rsync -aAHXx --inplace --8-bit-output \
+                              --exclude-from=/tmp/ef $IMGMNT/ $tgtdir
+                        [[ $clone ]] && sed -i '1 d' /usr/lib/fedora-release
+                        unset -v 'clone'
+                        rm /tmp/ef
+                    else
+                        cp -Ta $IMGMNT/. $tgtdir
+                    fi
+                    [[ $tsc == [XP] ]] && f=done
+                    ;;
+                [FS][EXP])
+                    unsquashfs -f -d $tgtdir "$SRCMNT/$srcdir/$squashimg"
+                    [[ $tsc == [XP] ]] && f=done
+            esac
+            [[ $tsc == P ]] && {
+                # semi-LiveOS installation
+                rm $tgtdir/etc/systemd/system/multi-user.target.wants/livesys*.service || :; }
+            if [[ $tsc == [EXP] ]]; then         # rfs_call @(expand|embedded-fsimg)
+                umount $tgtdir
+                rmdir $tgtdir
+                sleep 1
+                fscheck ${rfs_v[1]} $i
+                [[ $tsc == E ]] && sq_src=$TGTDIR/LiveOS
+            fi
+            if [[ $rfs_call != compress ]]; then
+                [[ $RFSwasMounted ]] || umount $IMGMNT >/dev/null 2>&1 || :
+                [[ -b $fsloop ]] && losetup -d $fsloop
+                [[ $rfs_call == expand ]] && f=done
+            fi
+            [[ -d $fsloop ]] && losetup -d $fsloop
+        fi
+        if [[ $f != done ]] && { [[ ! $flat_srcimg ]] ||
+           [[ $IMGFS != squashfs ]] || [[ ${mksqfs[1]} || $clone ]];} then
+            case $rfs_call in
+                '')
+                    ops+=' -keep-as-directory ' ;;
+                compress)
+                    sq_src=$SRCMNT/$LIVEOS ;;
+                mksqfs|flat-sqfsimg|clone)
+                    sq_src=$IMGMNT
+                    if [[ $iso_mp ]]; then
+                        RFSIMG=/dev/mapper/live-base
+                    elif [[ ! $clone ]]; then
+                        :
+                    fi
+            esac
+            if [[ $unsqfs == unsqfs ]] || {
+                [[ $flat_srcimg && $IMGFS == squashfs ]] &&
+                [[ $rfs_call != @(''|flat-sqfsimg|embedded-fsimg) ]] &&
+                [[ ! $clone ]] ;}; then
+                d=$TGTMNT/$LIVEOS/LiveOS
+                [[ $unsqfs ]] && tgtdir=$TGTMNT/$LIVEOS
+                unsquashfs -f -d $tgtdir "$SRCMNT/$srcdir/$squashimg"
+                [[ $RFSwasMounted ]] || umount $IMGMNT >/dev/null 2>&1 || :
+            fi
+            if [[ ${mksqfs[1]} || $clone ]]; then
+                ops='-comp zstd -b 1M -one-file-system -no-recovery '\
+'-not-reproducible -noappend'
+                [[ $IMGFS == overlay ]] && ops=${ops/-one-file-system /}
+                [[ $tsc == S ]] && ops+=' -nopad'
+                [[ $clone ]] && [[ $tsc != E ]] && {
+                    cat <<'EOF' >/tmp/ef
+/etc/machine-id
+/var/lib/dbus/machine-id
+
+EOF
+#/var/tmp
+#/dev
+#/proc
+#/run
+#/sys
+#/tmp
+                    cat <<'EOF' >/tmp/pf
+/dev d 755 root root
+/proc d 555 root root
+/run d 755 root root
+/sys d 555 root root
+/tmp d 777 root root
+/var/tmp d 777 root root
+EOF
+                    findmnt --real --type nofuse.portal -nro TARGET >> /tmp/ef
+                }
+                [[ $rfs_call == embedded-fsimg ]] &&
+                    ops+=' -keep-as-directory '
+                i=squashfs.img
+                if [[ $clone == live ]] && ! [[ $iso_mp ]]; then
+                    i=_squashfs.img
+                fi
+                { [[ $rfspartition ]] && i=$rfs_p ;} || i=$TGTMNT/$LIVEOS/$i
+
+                mksquashfs $sq_src $i $ops ${clone:+ -ef /tmp/ef -pf /tmp/pf}
+
+                [[ $RFSwasMounted ]] ||
+                    umount $IMGMNT $IMGMNT >/dev/null 2>&1 || :
+                [[ $rfs_call == @(compress|embedded-fsimg) ]] &&
+                    rm -rf --one-file-system -- $sq_src
+            elif [[ $f != done ]]; then
+                RFSIMG=$sq_src/LiveOS/rootfs.img
+                [[ -s $RFSIMG ]] || RFSIMG=$sq_src/LiveOS/ext3fs.img
+                #i=$TGTMNT/$LIVEOS/rootfs.img
+                mv $RFSIMG $TGTMNT/$LIVEOS/rootfs.img
+            fi
+        fi
+        [[ $clone ]] && { sed -i '1 d' /usr/lib/fedora-release
+            rm /tmp/ef /tmp/pf >/dev/null 2>&1 || : ;}
+        [[ $ssc == [PX] ]] && unset -v 'clone'
+        [[ $tsc == S ]] &&
+            # Hack squashfs.img to point to the SquashFS partition.
+            ln -s /dev/disk/by-partuuid/$PARTUUID $TGTMNT/$LIVEOS/squashfs.img
+    f=done
+    fi
+    if [[ $f != done ]] && [[ -f $SRCIMG ]]; then
         $copyFile "$SRCIMG" $TGTMNT/$LIVEOS/${SRCIMG##/*/} || exitclean
+        [[ ${SRCIMG##/*/} == rootfs.img ]] &&
+            fscheck $IMGFS $TGTMNT/$LIVEOS/${SRCIMG##/*/}
         [[ ${SRCIMG##/*/} == squashed.img ]] &&
             mv $TGTMNT/$LIVEOS/${SRCIMG##/*/} $TGTMNT/$LIVEOS/squashfs.img
     fi
-    if [[ -s $SRCHOME && -n $copyhome ]]; then
+    [[ $RFSwasMounted ]] || umount $IMGMNT $IMGMNT >/dev/null 2>&1 || :
+
+    if [[ -s $SRCHOME && $copyhome ]]; then
         $copyFile $SRCHOME $HOMEPATH || exitclean
     fi
-    if [[ -s $SRCOVL && -n $copyoverlay ]]; then
+    if [[ -s $SRCOVL && $copyoverlay ]]; then
         printf 'Copying overlay...'
         cp -a "$SRCOVL" $OVLPATH || exitclean
         [[ -d $SRCOVL ]] && {
             cp -a "$SRCOVL/../ovlwork" $OVLPATH/../ovlwork || exitclean; }
     fi
-    printf '\nSyncing filesystem writes to disc.
-    Please wait, this may take a while...\n'
-    sync -f $TGTMNT/$LIVEOS/
-fi
-if [[ -n $resetoverlay || -n $copyoverlay ]]; then
-    if [[ -d $OVLPATH ]]; then
-        overlayfs=$TGTFS
-    else
-        # Find if OVLPATH is a filesystem.
-        existing=$(blkid -s TYPE -o value $OVLPATH || :)
-        [[ -n $existing && $existing != DM_snapshot_cow ]] &&
-            overlayfs=$existing
-    fi
+    : > $TGTMNT/$LIVEOS/origin:\ "${SRC##*/}"
 fi
 
 # Bootloader is always reconfigured, so keep this out of the -z skipcopy stuff.
@@ -2802,24 +3542,61 @@ if [[ ! -f $BOOTCONFIG ]]; then
     fi
 fi
 
-TITLE=$(sed -n -r '/^\s*label\s+linux/I {n
-                   s/^\s*menu\s+label\s+\^\S+\s+(.*)/\1/Ip;q}
-                  ' $BOOTCONFIG)
-# # Escape special characters for sed regex and replacement strings.
-_TITLE=$(sed 's/[]\/;$*.^?+|{}&[]/\\&/g' <<< $TITLE)
-
 # Copy LICENSE and README.
-if [[ -z $skipcopy ]]; then
-    for f in $SRCMNT/LICENSE $SRCMNT/Fedora-Legal-README.txt; do
+if [[ ! $skipcopy ]]; then
+    for f in $SRCMNT/$srcdir/../LICENSE \
+             $SRCMNT/$srcdir/../Fedora-Legal-README.txt; do
         [[ -f $f ]] && cp -p $f $TGTMNT >/dev/null 2>&1 || :
     done
 fi
 
-[[ -e $BOOTCONFIG_EFI.multi ]] && rm $BOOTCONFIG_EFI.multi
+if [[ $resetoverlay || $copyoverlay ]]; then
+    if [[ -d $OVLPATH ]]; then
+        OverlayFS=$TGTFS
+    else
+        # Find if OVLPATH is a filesystem.
+        existing=$(blkid -s TYPE -o value $OVLPATH || :)
+        [[ $existing && $existing != DM_snapshot_cow ]] && OverlayFS=$existing
+    fi
+fi
+
+# Bootloader is always reconfigured, so keep this out of the ! skipcopy stuff.
+if [[ $SLNX_CFG ]]; then
+    [[ ! -d $TGTMNT$SYSLINUXPATH ]] && mkdir -p $TGTMNT$SYSLINUXPATH
+
+    cp -up $boot_src/* $TGTMNT$SYSLINUXPATH >/dev/null 2>&1 || :
+    cp -p $boot_src/???linux.c* $TGTMNT$SYSLINUXPATH >/dev/null 2>&1 || :
+
+#    SLNX_CFG=$TGTMNT$SYSLINUXPATH/isolinux.cfg
+    # Adjust syslinux sources for replication of installed images
+    # between filesystem types.
+    if ! [[ -f $SLNX_CFG ]]; then
+        for f in extlinux.conf syslinux.cfg; do
+            f=$TGTMNT$SYSLINUXPATH/$f
+            [[ -f $f ]] && mv $f $SLNX_CFG && break
+        done
+    fi
+elif [[ $GRUBonly ]] && ! [[ $SRCMNT/boot -ef $TGTMNT/boot ]]; then
+    cp -au $SRCMNT/$srcdir/../boot $TGTMNT
+    cp -a $SRCMNT/$srcdir/../boot/grub2/grub.cfg $TGTMNT/boot/grub2
+fi
+
+
+[[ -e $GRUB_CFG.multi ]] && rm $GRUB_CFG.multi
 
 config_efi() {
     echo "Setting up $T_EFI_BOOT"
     [[ ! -d $TGTMNT$T_EFI_BOOT ]] && mkdir -p $TGTMNT$T_EFI_BOOT
+    # Account for previous installations on other partitions of this disk:
+    if [[ ! ${format[1]} ]] && [[ -b $esp ]]; then
+        ESPMNT=$(mktemp -d /tmp/espmnt.XXXXX)
+        mount -r $esp $ESPMNT
+        cp -p $ESPMNT$EFI_BOOT/grub.cfg $GRUB_CFG
+        umount $ESPMNT && rmdir $ESPMNT
+        uuids=$(sed -n -r "/^\s*search\s+.*\s+-u\s+(\S+).*/ s//\1/p" \
+            $GRUB_CFG | sort --unique)
+        uuids=${uuids/$TGTUUID/}
+    fi
 
     # The GRUB EFI config file can be one of:
     #   boot?*.conf
@@ -2827,18 +3604,21 @@ config_efi() {
     #   grub.cfg
 
     # Test for EFI config file on target device from previous installation.
-    if [[ -f $TGTMNT$T_EFI_BOOT/grub.cfg ]]; then
-        # (Prefer grub.cfg over boot*.conf set above.)
-        BOOTCONFIG_EFI=$TGTMNT$T_EFI_BOOT/grub.cfg
-    fi
-    if [[ -f $BOOTCONFIG_EFI && ( -n $multi || -n $multidirs ) ]]; then
-        mv -Tf $BOOTCONFIG_EFI $BOOTCONFIG_EFI.multi
-    fi
-    if [[ $TGTMNT/EFI -ef $SRCMNT/EFI ]]; then
-        cp $BOOTCONFIG_EFI.multi $BOOTCONFIG_EFI
+#    if [[ -f $TGTMNT$T_EFI_BOOT/grub.cfg ]]; then
+#        # (Prefer grub.cfg over boot*.conf set above.)
+#        GRUB_CFG=$TGTMNT$T_EFI_BOOT/grub.cfg
+#        { [[ $multi$multidirs ]] || [[ $TGTMNT/EFI -ef $SRCMNT/EFI ]] ;} &&
+     [[ -f $GRUB_CFG ]] && mv -Tf $GRUB_CFG $GRUB_CFG.multi
+#    fi
+#    if [[ -f $GRUB_CFG && $multi$multidirs ]]; then
+#        mv -Tf $GRUB_CFG $GRUB_CFG.multi
+#    fi
+    if [[ $TGTMNT/EFI -ef $SRCMNT/$srcdir/../EFI ]]; then
+        cp $GRUB_CFG.multi $GRUB_CFG
     else
-        cp -Trup $SRCMNT$EFI_BOOT $TGTMNT$T_EFI_BOOT >/dev/null 2>&1 || :
-        cp $SRCMNT$EFI_BOOT/grub.cfg $TGTMNT$T_EFI_BOOT
+        # Only copy newer objects.
+        cp -Trup $SRCMNT/$srcdir/..$EFI_BOOT $TGTMNT$T_EFI_BOOT >/dev/null 2>&1 || :
+        cp $SRCMNT/$srcdir/..$EFI_BOOT/grub.cfg $GRUB_CFG  #$TGTMNT$T_EFI_BOOT
 
 	# Manipulate full bootloader version of grub.cfg not the stub
 	if [[ -n $bootloaderarch && -f $SRCMNT/boot/grub2/grub.cfg ]]; then
@@ -2849,13 +3629,19 @@ config_efi() {
 
         rm -f $TGTMNT$T_EFI_BOOT/grub.conf
     fi
+    # Remove useless Test menuentry.
+    # Keep only the first two menu entries for a template.
+    #   (Uses exchange and '.' as a flag in the hold buffer to count matches;
+    #    q to ignore pattern buffer and quit.)
+    sed -i -r "/^\s*menuentry\s+'Test this media/,/^}$/ d
+               /^}$/{x;/../{x;q};s/.*/&./;x}" $GRUB_CFG
 
     # Select config file for initial installations.
-    BOOTCONFIG_EFI=$TGTMNT$T_EFI_BOOT/grub.cfg
-    if [[ ! -f $BOOTCONFIG_EFI ]]; then
-        BOOTCONFIG_EFI=($(nocase_path "$TGTMNT$T_EFI_BOOT/boot*.conf"))
+#    GRUB_CFG=$TGTMNT$T_EFI_BOOT/grub.cfg
+    if [[ ! -f $GRUB_CFG ]]; then
+        GRUB_CFG=($(nocase_path "$TGTMNT$T_EFI_BOOT/boot*.conf"))
     fi
-    if [[ -n $efi && ! -f $BOOTCONFIG_EFI ]]; then
+    if [[ $efi && ! -f $GRUB_CFG ]]; then
         echo "Unable to find an EFI configuration file."
         exitclean
     fi
@@ -2867,20 +3653,20 @@ config_efi() {
     local bootefi=($(nocase_path "$TGTMNT$T_EFI_BOOT/boot*efi"))
     #^ Use compound array assignment to accommodate presence of multiple files.
     if [[ ! -f $bootefi ]]; then
-        if ! type dumpet >/dev/null 2>&1 && [[ -n $efi ]]; then
+        if ! type dumpet >/dev/null 2>&1 && [[ $efi ]]; then
             echo "No /usr/bin/dumpet tool found. EFI image will not boot."
             echo "Source media is missing GRUB binary in /EFI/BOOT/*EFI."
             exitclean
         else
             # dump the eltorito image with dumpet, output is $SRC.1
             dumpet -i "$SRC" -d
-            local EFIMNT=$(mktemp -d /run/srctmp.XXXXXX)
+            local EFIMNT=$(mktemp -d /tmp/srctmp.XXXXXX)
             mount -o loop "$SRC".1 $EFIMNT
 
             bootefi=($(nocase_path "$EFIMNT$EFI_BOOT/boot*efi"))
             if [[ -f $bootefi ]]; then
                 cp -t $TGTMNT$T_EFI_BOOT ${bootefi[*]}
-            elif [[ -n $efi ]]; then
+            elif [[ $efi ]]; then
                 echo "No BOOT*.EFI found in eltorito image. EFI will not boot."
                 umount $EFIMNT
                 rm "$SRC".1
@@ -2894,41 +3680,48 @@ config_efi() {
 
 # Always install EFI components, when available, so that they are available to
 # propagate, if desired from the installed system.
-if [[ -n $EFI_BOOT ]]; then
+if [[ $EFI_BOOT ]]; then
     config_efi
 else
     # So sed doesn't complain about missing input variable...
-    BOOTCONFIG_EFI=''
+    GRUB_CFG=''
+fi
+
+TITLE=$(sed -n -r "
+           0,/^menuentry/ s/.*'Start\s+(\S+\s+~|)(.*)'\s+.*/\2/ p" $GRUB_CFG)
+# # Escape special characters for sed regex and replacement strings.
+_TITLE=$(sed 's/[]\/;$*.^?+|{}&[]/\\&/g' <<< $TITLE)
+if [[ $srctype == clone ]]; then
+    z=$(sed -n "/PRETTY_NAME=/s//$(date +%d%b%Y)-/ p" </etc/os-release)
+    z=$(sed 's/[]\/;$*.^?+|{}&[]/\\&/g' <<< $z)
+    sed -i "s/$_TITLE/$z/" $SLNX_CFG $GRUB_CFG
 fi
 
 # DVD installer copy
 # Always install /images directory, when available, so that they may be used
 # to propagate a new installation from the installed system.
-if [[ -z $skipcopy ]]; then
+if [[ ! $skipcopy ]]; then
     echo "Copying /images directory to the target device."
-    if [[ -d $SRCMNT/$srcdir/syslinux ]]; then
-        sources="$SRCMNT/$srcdir/images"
-    else
-        sources="$SRCMNT/images"
-    fi
-    p=${sources%/images}
+    sources=$SRCMNT/$srcdir/images
+    [[ -d $SRCMNT/$srcdir/images ]] || sources="$SRCMNT/$srcdir/../images"
+    s=${sources%/images}
     # Fedora42: Images are now under target-specific bootloader directory
-    if [[ -n $bootloaderarch && ! -d $sources ]]; then
-	sources="$SRCMNT/boot/$bootloaderarch/loader"
-	p=${sources%/loader}
+    if [[ $bootloaderarch && ! -d $sources ]]; then
+		sources="$SRCMNT/boot/$bootloaderarch/loader"
+		s=${sources%/loader}
     fi
     for f in $(find $sources); do
         if [[ -d $f ]]; then
-            if ! [[ -d $TGTMNT/$multi${f#$p} ]]; then
-                mkdir $TGTMNT/$multi${f#$p} || exitclean
+            if ! [[ -d $TGTMNT${multi:+/$multi}${f#$s} ]]; then
+                mkdir $TGTMNT${multi:+/$multi}${f#$s} || exitclean
             fi
         else
-            $copyFile $f $TGTMNT/$multi${f#$p} || exitclean
+            $copyFile $f $TGTMNT${multi:+/$multi}${f#$s} || exitclean
         fi
     done
     # Fedora42: Rename directory to images
-    if [[ -n $bootloaderarch && -d "$TGTMNT/loader" ]]; then
-	mv "$TGTMNT/loader" "$TGTMNT/images"
+    if [[ $bootloaderarch && -d "$TGTMNT/loader" ]]; then
+		mv "$TGTMNT/loader" "$TGTMNT/images"
     fi
 fi
 
@@ -2939,36 +3732,41 @@ fi
 # And then in F23 the LiveOS/squashfs.img moved back to images/install.img
 # So copy over Packages, repodata and all other top level directories, anaconda
 # should detect them and use them automatically.
-if [[ -n $packages && -z $skipcopy ]]; then
+if [[ $packages && ! $skipcopy ]]; then
     echo "Copying package data from $SRC to device."
     rsync --inplace -rLDP --exclude EFI/ --exclude images/ --exclude isolinux/ \
         --exclude TRANS.TBL --exclude LiveOS/ "$SRCMNT/" "$TGTMNT/"$multi
     echo "Waiting for device to finish writing."
-    sync -f "$TGTMNT/"
+#    sync -f "$TGTMNT/"
 fi
+printf '\nSyncing filesystem writes to disc.
+Please wait, this may take a while...\n'
+sync -f $TGTMNT/
+#    read
+#    fscheck ${rfs_v[1]} $i
 
-if [[ $srctype == live ]]; then
+if [[ $srctype == @(live|clone) ]]; then
     # Copy this installer script.
     cp -fT "$thisScriptpath" $TGTMNT/$LIVEOS/livecd-iso-to-disk
     chmod +x $TGTMNT/$LIVEOS/livecd-iso-to-disk &> /dev/null || :
 
-    # When the source is an installed Live USB/SD image, restore the boot
-    # config file to a base state before updating.
-    if [[ -d $SRCMNT/syslinux/ ]]; then
-        echo "Preparing boot config files."
-        # Delete all labels before the 'linux' menu label.
-        sed -i -r '/^\s*label .*/I {
-                   /^\s*label\s+linux\>/I ! {N;N;N;N
-                   /\<kernel\s+[^ ]*menu.c32\>/d};}' $BOOTCONFIG
-        sed -i -r '/^\s*menu\s+end/I,$ {
-                   /^\s*menu\s+end/I ! d}' $BOOTCONFIG
-        # Keep only the menu entries up through the first submenu as template.
-        if [[ -n $BOOTCONFIG_EFI ]]; then
-            sed -i -r "/\s+}$/ { N
-                       /\n}$/ { n;Q}}" $BOOTCONFIG_EFI
-        fi
-        # Restore configuration entries to a base state.
-        sed -i -r "s/^\s*timeout\s+.*/timeout 600/I
+    if [[ $SLNX_CFG ]]; then
+        # Remove rd.live.check menu
+        sed -i -r '/^\s*label\s+check/I {N;N;N;N;N
+                   d}' $SLNX_CFG
+        # When the source is an installed Live USB/SD image, restore the boot
+        # config file to a base state before updating.
+        if [[ -d $SRCMNT/$srcdir/../syslinux/ || $skipcopy ]]; then
+            echo "Preparing boot config files."
+            # Delete all labels before the 'linux' menu label.
+            sed -i -r '/^\s*label .*/I {
+                       /^\s*label\s+linux\>/I ! {N;N;N;N
+                       /\<kernel\s+[^ ]*menu.c32\>/d};}' $SLNX_CFG
+            sed -i -r '/^\s*menu\s+end/I,$ {
+                       /^\s*menu\s+end/I ! d}' $SLNX_CFG
+            # Restore configuration entries to a base state.
+            sed -i -r "1 s/^\s*set\s+default=.*/set default=0/I
+s/^\s*timeout\s+.*/timeout 600/I
 /^\s*totaltimeout\s+.*/Iz
 0,/^\s*menu\s+title\s+Multi Live Image Boot Menu/I {
 s/^\s*(menu\s+title\s+).*/\1$_TITLE/I}
@@ -2976,69 +3774,78 @@ s/^(\s*\<kernel)\>\s+\S*(vmlinuz.?)/\1 \2/
 /^\s*append\>/I {
 s/\<(initrd=).*(initrd.?\.img)\>/\1\2/
 s/\<rd\.live\.[^c]\S+\s+//2g}
-                  " $BOOTCONFIG
+                  " $SLNX_CFG
+        fi
     fi
 
     # Escape special characters for sed regex and replacement strings.
     _LIVEOS=$(sed 's/[]\/;$*.^?+|{}&[]/\\&/g' <<< $LIVEOS)
-    if [[ -n $BOOTCONFIG_EFI ]]; then
+    if [[ $GRUB_CFG ]]; then
         # If --multi, distinguish the new grub menuentry with '$LIVEOS ~'.
-        [[ -f $BOOTCONFIG_EFI.multi ]] && [[ $_1stindir != $LIVEOS ]] && livedir=$_LIVEOS\ ~
-        sed -i -r "s/^\s*set\s+timeout=.*/set timeout=60/
+        [[ $multi$multidirs ]] && [[ $_1stindir != $LIVEOS ]] && livedir=$_LIVEOS\ ~
+        sed -i -r "1 s/^\s*set\s+default=.*/set default=0/
+s/^\s*set\s+timeout=.*/set timeout=60/
 /^\s*menuentry/ {
 s/\S+\s+~$_TITLE/$_TITLE/
 s/(^\s*menuentry\s+'.*)$_TITLE(.*')/\1$livedir$_TITLE\2/}
-/^\s+linuxefi|initrdefi/ {
-s_(linuxefi|initrdefi)\s+\S+(initrd.?\.img|vmlinuz.?)_\1 /images/pxeboot/\2_
+/^\s*insmod\s+(ext2|fat|xfs|f2fs|btrfs)\s*/ d
+/^\s*search\s+/ d
+/^\s+linux|initrd/ {
+s;(linuxefi|initrdefi|linux|initrd)\s+\S+(initrd.?\.img|vmlinuz.?);\1 /images/pxeboot/\2;
 s/\<rd\.live\.[^c]\S+\s+//2g}
-                 " $BOOTCONFIG_EFI
+                 " $GRUB_CFG
     fi
 fi
 
 # Escape any special characters \/;& for sed replacement strings.
-[[ -n $multi ]] && _multi=$(sed 's/[\/;&]/\\&/g' <<< "/$multi")
+[[ $multi ]] && _multi=$(sed 's/[\/;&]/\\&/g' <<< "/$multi")
 
 # Setup the updates.img
-if [[ -n $updates ]]; then
+if [[ $updates ]]; then
     $copyFile "$updates" "$TGTMNT/$multi/updates.img"
     kernelargs+=" inst.updates=hd:$TGTLABEL:$_multi/updates.img"
 fi
 
 # Setup the kickstart
-if [[ -n $ks ]]; then
+if [[ $ks ]]; then
     $copyFile "$ks" "$TGTMNT/$multi/ks.cfg"
     kernelargs+=" inst.ks=hd:$TGTLABEL:$_multi/ks.cfg"
 fi
 
 echo "Updating boot config files."
 # adjust label and fstype
-sed -i -r "s/\<root=[^ ]*/root=live:$TGTLABEL/g
+sed -i -r "s/\<root=\S+/root=live:$TGTLABEL/g
         s;inst.stage2=hd:LABEL=[^ ]*;inst.stage2=hd:$TGTLABEL:$_multi/images/install.img;g
-        s/\<rootfstype=[^ ]*\>/rootfstype=$TGTFS/" $BOOTCONFIG $BOOTCONFIG_EFI
+        s/\<rootfstype=\S+\>/rootfstype=$TGTFS/" $SLNX_CFG $GRUB_CFG
 
-if [[ -n $kernelargs ]]; then
-    sed -i -r "/^\s*append|linuxefi/I {
-    s/\s+(rd\.live\.image)(.*)$/ \1 ${kernelargs} \2/
-    }" $BOOTCONFIG $BOOTCONFIG_EFI
+case ${rfs_v[1]} in
+    f2fs )
+        [[ $(dump.f2fs $rfs_p) =~ compression ]] && {
+            tgtmountops=-o\ compress_algorithm=zstd:6,compress_chksum,atgc,gc_merge,lazytime
+            kernelargs+=\ rootflags=${tgtmountops#-o }
+        }
+        ;;
+    btrfs )
+        tgtmountops=-o\ compress=zstd
+        kernelargs+=\ rootflags=${tgtmountops#-o }
+esac
+
+if [[ $kernelargs ]]; then
+    sed -i -r "/^\s*append|linux/I {
+    s;\s+(rd\.live\.image)(.*)$; \1 ${kernelargs} \2;
+    }" $SLNX_CFG $GRUB_CFG
 fi
 
-if [[ -n $BOOTCONFIG_EFI ]]; then
+if [[ $GRUB_CFG ]]; then
     # EFI images are in $SYSLINUXPATH now.
-    _SYSLINUXPATH=$(sed 's/[]\/;$*.^?+|{}&[]/\\&/g' <<< $SYSLINUXPATH)
-    f=$(lsblk -ndro PTTYPE $device)
-    [[ $f == dos ]] && f=msdos
-    f="/^\s*insmod\s+part_(gpt|msdos)\s*$/ s;(gpt|msdos);$f;
-      "
+    f="/^\s*insmod\s+part_(gpt|msdos)\s*$/ s;(gpt|msdos);$PTTYPE;
+    "
     case $TGTFS in
-        vfat|msdos)
-            i=fat
-            ;;
-        ext[432])
-            i=ext2
-            ;;
-        *)
-            i=$TGTFS
+        vfat|msdos) i=fat ;;
+        ext[432]) i=ext2 ;;
+        *) i=$TGTFS
     esac
+#<<<<<<< HEAD
     f+="/^\s*insmod\s+(ext2|fat|xfs|f2fs|btrfs)\s*$/ s;(ext2|fat|xfs|f2fs|btrfs);$i;
        "
     sed -i -r "$f/^\s*search.*--set=root\s+/ s/-(l|u).*/-u '$TGTUUID'/
@@ -3046,120 +3853,147 @@ if [[ -n $BOOTCONFIG_EFI ]]; then
                s;/images/pxeboot/;/$_SYSLINUXPATH/;g
                s;findiso;;g" $BOOTCONFIG_EFI
     # Fedora42: Change root search to use UUID and adjust image locations as above
-    if [[ -n $bootloaderarch ]]; then
-	sed -i -r "s;\\(\\\$root\\)/boot/$bootloaderarch/loader/;/$_SYSLINUXPATH/;
+    if [[ $bootloaderarch ]]; then
+		sed -i -r "s;\\(\\\$root\\)/boot/$bootloaderarch/loader/;/$_SYSLINUXPATH/;
                    s;^\s*search.*--set=root.*$;search --no-floppy --set=root -u '$TGTUUID';" $BOOTCONFIG_EFI
     fi
+#=======
+    #f+="/^\s*linux/ i\
+    #\    insmod $i\\
+    #search --no-floppy --set=root -u $TGTUUID
+    #"
+#    if [[ $SLNX_CFG ]]; then
+#        _BOOTPATH=$(sed 's/[]\/;$*.^?+|{}&[]/\\&/g' <<< $SYSLINUXPATH)
+#    else
+    #_BOOTPATH=${multi:+\\/$_LIVEOS}\\/images\\/pxeboot\\/
+#    fi
+    #sed -i -r "$f s;\\/isolinux\\/;$_BOOTPATH;g
+               #s;\\/images\\/pxeboot\\/;$_BOOTPATH;g
+               #s;findiso;;g" $GRUB_CFG
+#>>>>>>> 8e43a57 (livecd-iso-to-disk: Enhance script for new .iso structures)
 fi
 
 # DVD Installer for netinst
-if [[ $srctype != live ]]; then
+if [[ $srctype != live ]] && [[ $imgtype != install ]]; then
     # install images will have already had their stage2 setup by the LABEL
     # substitution and non-install will have everything in the initrd.
-    if [[ $imgtype != install ]]; then
-        # The initrd has everything, so no stage2.
-        sed -i "s;\S*stage2=\S*;;g" $BOOTCONFIG $BOOTCONFIG_EFI
-    fi
+    # The initrd has everything, so no stage2.
+    sed -i "s;\S*stage2=\S*;;g" $SLNX_CFG $GRUB_CFG
 fi
 
 # Adjust the boot timeouts
-if [[ -n $timeout ]]; then
+if [[ $timeout ]]; then
     [[ $timeout == "-0" ]] && { timeout=1; totaltimeout=1; }
     sed -i -r "s/^\s*timeout.*$/timeout $((timeout==-1 ? 0 : timeout))/I
-              " $BOOTCONFIG
-    if [[ -n $BOOTCONFIG_EFI ]]; then
+              " $SLNX_CFG
+    if [[ $GRUB_CFG ]]; then
         if [[ $timeout != @(0|-1) ]]; then
             set +e
             ((timeout = (timeout%10) > 4 ? (timeout/10)+1 : (timeout/10) ))
             set -e
         fi
-        sed -i -r "s/^\s*(set\s+timeout=).*$/\1$timeout/" $BOOTCONFIG_EFI
+        sed -i -r "s/^\s*(set\s+timeout=).*$/\1$timeout/
+                  " $GRUB_CFG
     fi
 fi
-if [[ -n $totaltimeout ]]; then
-    sed -i -r "/\s*timeout\s+.*/ a\totaltimeout\ $totaltimeout" $BOOTCONFIG
+if [[ $SLNX_CFG ]]; then
+    if [[ $totaltimeout ]]; then
+        sed -i -r "/\s*timeout\s+.*/ a\totaltimeout\ $totaltimeout" $SLNX_CFG
+    fi
+    # Don't display boot.msg.
+    if [[ $nobootmsg ]]; then
+        sed -i '/display boot.msg/d' $SLNX_CFG
+    fi
+    # Skip the menu, and boot 'linux'.
+    if [[ $nomenu ]]; then
+        sed -i 's/default .*/default linux/' $SLNX_CFG
+    fi
 fi
-
-if [[ $overlay == none ]]; then
+if [[ $nooverlay ]]; then
     sed -i -r 's/rd\.live\.image|liveimg/& rd.live.overlay=none/
-              ' $BOOTCONFIG $BOOTCONFIG_EFI
+              ' $SLNX_CFG $GRUB_CFG
 fi
 
-# Don't display boot.msg.
-if [[ -n $nobootmsg ]]; then
-    sed -i '/display boot.msg/d' $BOOTCONFIG
-fi
-# Skip the menu, and boot 'linux'.
-if [[ -n $nomenu ]]; then
-    sed -i 's/default .*/default linux/' $BOOTCONFIG
-fi
-
-if [[ -n $overlaysizeb || -n $overlayfs ]] &&
-    [[ -z $resetoverlay && -z $copyoverlay ]]; then
-    if [[ -z $skipcopy ]]; then
+if [[ $overlaysizeb || $OverlayFS ]] &&
+    [[ ! $resetoverlay && ! $copyoverlay ]]; then
+    if [[ ! $skipcopy ]]; then  #&& ! ([[ $clone ]] && [[ ! $rfspartition ]])
         echo "Initializing persistent overlay..."
-        case $overlayfs in
+        embed_overlay() {
+            echo 'Formatting OverlayFS...'
+            mkfs_config ovl OVERLAY overlaysizeb $OVLPATH
+            $mkfs $ops
+            [[ ${overlaysizeb[1]} == ext[432] ]] &&
+                tune2fs -c0 -i0 -ouser_xattr,acl $OVLPATH
+            [[ -b $fsloop ]] && losetup -d $fsloop
+            ovl=$(mktemp -d)
+            mount $OVLPATH $ovl
+            mkdir -m 0755 --context=system_u:object_r:root_t:s0 \
+                $ovl/overlayfs $ovl/ovlwork
+            umount $ovl
+            chmod 0600 $OVLPATH &> /dev/null || :
+        }
+        case $OverlayFS in
             ext[432]|xfs|btrfs|f2fs)
-                mkdir -m 0755 --context=system_u:object_r:root_t:s0 \
-                    $OVLPATH $OVLPATH/../ovlwork
+                if [[ $overlaysizeb ]]; then
+                    embed_overlay
+                else
+                    rm -rf --one-file-system -- $OVLPATH/../ovlwork $OVLPATH || :
+                    mkdir -m 0755 --context=system_u:object_r:root_t:s0 \
+                        $OVLPATH $OVLPATH/../ovlwork
+                fi
                 ;;
             vfat|msdos)
-                echo 'Formatting overlayfs...'
-                mkfs_config ovl OVERLAY overlaysizeb $OVLPATH
-                $mkfs $ops
-                [[ ${overlaysizeb[1]} == ext[432] ]] &&
-                    tune2fs -c0 -i0 -ouser_xattr,acl $OVLPATH
-                [[ -n $loop ]] && losetup -d $loop
-                ovl=$(mktemp -d)
-                mount $OVLPATH $ovl
-                mkdir -m 0755 --context=system_u:object_r:root_t:s0 \
-                    $ovl/overlayfs $ovl/ovlwork
-                umount $ovl
-                chmod 0600 $OVLPATH &> /dev/null || :
+                embed_overlay
                 ;;
             '')
+                # DM_snapshot_cow
                 falloc $overlaysizeb $OVLPATH
                 chmod 0600 $OVLPATH &> /dev/null || :
         esac
     fi
-    if [[ -n $overlayfs ]]; then
+    if [[ $OverlayFS ]]; then
         sed -i -r 's/rd\.live\.image|liveimg/& rd.live.overlay.overlayfs/
-                  ' $BOOTCONFIG $BOOTCONFIG_EFI
+                  ' $SLNX_CFG $GRUB_CFG
     fi
-    if [[ -n $overlaysizeb || x${overlayfs#temp} != x ]]; then
-        sed -i -r "s/rd\.live\.image|liveimg/& rd.live.overlay=${TGTLABEL}/
-                  " $BOOTCONFIG $BOOTCONFIG_EFI
+    if [[ $overlaysizeb || x${OverlayFS#temp} != x ]]; then
+        sed -i -r "s/rd\.live\.image|liveimg/& rd.live.overlay=$_OVLPATH/
+                  " $SLNX_CFG $GRUB_CFG
     fi
 fi
 
-# (Allow overlay reset with --skipcopy repair.)
-if [[ -n $resetoverlay ]]; then
+resetovl() {
+    local ovlpath=$1
     printf 'Resetting the overlay.\n'
-    if [[ $overlayfs == @(vfat|msdos) ]]; then
-        ovl=$(mktemp -d)
-        mount $OVLPATH $ovl
+    if [[ $OverlayFS == @(vfat|msdos) ]]; then
+        local ovl=$(mktemp -d)
+        mount $ovlpath $ovl
         rm -r -- $ovl/overlayfs
         mkdir -m 0755 --context=system_u:object_r:root_t:s0 $ovl/overlayfs
         umount $ovl
-    elif [[ -d $OVLPATH ]]; then
-        rm -r -- $OVLPATH
+    elif [[ -d $ovlpath ]]; then
+        rm -r -- $ovlpath/../ovlwork $ovlpath
         mkdir -m 0755 --context=system_u:object_r:root_t:s0 \
-            $OVLPATH $OVLPATH/../ovlwork
+            $ovlpath $ovlpath/../ovlwork
     else
-        dd if=/dev/zero of=$OVLPATH bs=64k count=1 conv=notrunc,fsync
+        dd if=/dev/zero of=$ovlpath bs=64k count=1 conv=notrunc,fsync
     fi
-fi
-[[ $overlayfs == @(vfat|msdos) ]] && fscheck ${overlaysizeb[1]} $OVLPATH
-if [[ -n $resetoverlay || -n $copyoverlay ]]; then
+}
+
+# (Allow overlay reset with --skipcopy repair.)
+[[ $resetoverlay ]] && resetovl $OVLPATH
+
+[[ $OverlayFS == @(vfat|msdos) ]] && fscheck ${overlaysizeb[1]} $OVLPATH
+
+if [[ $resetoverlay || $copyoverlay ]]; then
     ovl=''
-    [[ -n $overlayfs ]] && ovl=' rd.live.overlay.overlayfs'
-    sed -i -r "s/rd\.live\.image|liveimg/& rd.live.overlay=${TGTLABEL}$ovl/
-              " $BOOTCONFIG $BOOTCONFIG_EFI
+    [[ $OverlayFS ]] && ovl=' rd.live.overlay.overlayfs'
+    sed -i -r "s/rd\.live\.image|liveimg/& rd.live.overlay=$_OVLPATH$ovl/
+              " $SLNX_CFG $GRUB_CFG
 fi
 
 if ((swapsizeb > 0)); then
     echo "Initializing swap file."
-    if [[ -z $skipcopy ]]; then
+    if [[ ! $skipcopy ]]; then
         falloc $swapsizeb $TGTMNT/$LIVEOS/swap.img
         [[ $TGTFS == btrfs ]] && chattr +C $TGTMNT/$LIVEOS/swap.img
         chmod 0600 $TGTMNT/$LIVEOS/swap.img &> /dev/null || :
@@ -3167,9 +4001,9 @@ if ((swapsizeb > 0)); then
     mkswap -f $TGTMNT/$LIVEOS/swap.img
 fi
 
-if ((homesizeb > 0)) && [[ -z $skipcopy ]]; then
+if ((homesizeb > 0)) && [[ ! $skipcopy ]]; then
     echo "Initializing persistent /home directory filesystem."
-    if [[ -n $cryptedhome ]]; then
+    if [[ $cryptedhome ]]; then
         dd if=/dev/urandom of=$HOMEPATH count=$((homesizeb>>20)) bs=1MiB\
         status=progress
         cloop=$(losetup -f --show $HOMEPATH)
@@ -3181,7 +4015,7 @@ if ((homesizeb > 0)) && [[ -z $skipcopy ]]; then
         while ! cryptsetup luksOpen $cloop EncHomeFoo; do :; done;
 
         mkfs_config home HOME homesizeb
-        $mkfs $ops /dev/mapper/EncHomeFoo
+        flock /dev/mapper/EncHomeFoo $mkfs $ops /dev/mapper/EncHomeFoo
         [[ ${homesizeb[1]} == ext[432] ]] &&
             tune2fs -c0 -i0 -ouser_xattr,acl /dev/mapper/EncHomeFoo
         sleep 2
@@ -3195,26 +4029,29 @@ if ((homesizeb > 0)) && [[ -z $skipcopy ]]; then
         [[ ${homesizeb[1]} == ext[432] ]] &&
             tune2fs -c0 -i0 -ouser_xattr,acl $HOMEPATH
         fscheck ${homesizeb[1]} $HOMEPATH
-        [[ -n $loop ]] && losetup -d $loop
+        [[ -b $fsloop ]] && losetup -d $fsloop
     fi
     chmod 0600 $HOMEPATH &> /dev/null || :
 fi
 
 if [[ $LIVEOS != LiveOS ]]; then
     sed -i -r "s;rd\.live\.image|liveimg;& rd.live.dir=$_LIVEOS;
-              " $BOOTCONFIG $BOOTCONFIG_EFI
+              " $SLNX_CFG $GRUB_CFG
 fi
 
-if [[ live = $srctype ]]; then
-    sed -i -r '/^\s*append|linuxefi/I {
-              s/\s+ro\>//g
-              s/rd\.live\.image|liveimg/rw &/}' $BOOTCONFIG $BOOTCONFIG_EFI
+if [[ $srctype == @(live|clone) ]]; then
+    sed -i -r "/^\s*append|linux/I {
+               s/\s+ro\>//g
+               s/rd\.live\.image|liveimg/rw &/
+               s/nomodeset\s+quiet\s+rhgb/nomodeset rd.live.debug/}
+              " $SLNX_CFG $GRUB_CFG
 fi
+#s/rd\.live\.image|liveimg/rw & rd\.live\.initrd=UUID=$TGTUUID:$_BOOTPATH/g}
 
 # create the forth files for booting on the XO if requested
 # we'd do this unconditionally, but you have to have a kernel that will
 # boot on the XO anyway.
-if [[ -n $xo ]]; then
+if [[ $xo ]]; then
     echo 'Setting up /boot/olpc.fth file.'
     while read -r args; do
         if [[ $args =~ ^append ]]; then
@@ -3222,8 +4059,8 @@ if [[ -n $xo ]]; then
             args=${args/ initrd=+([^ ])/}
             break
         fi
-    done < $TGTMNT/$SYSLINUXPATH/isolinux.cfg
-    if [[ -z $xonohome && ! -f $HOMEPATH ]]; then
+    done < $TGTMNT$SYSLINUXPATH/isolinux.cfg
+    if [[ ! $xonohome && ! -f $HOMEPATH ]]; then
         args=$args\ persistenthome=mtd0
     fi
     args=$args\ reset_overlay
@@ -3231,7 +4068,7 @@ if [[ -n $xo ]]; then
     if [[ ! -d $TGTMNT/boot ]]; then
         mkdir -p $TGTMNT/boot
     fi
-    cat > $TGTMNT/boot/olpc.fth <<EOF
+    cat > $TGTMNT/boot/olpc.fth <<'EOF'
 \ Boot script for USB boot
 hex  rom-pa fffc7 + 4 \$number drop  h# 2e19 < [if]
   patch 2drop erase claim-params
@@ -3263,92 +4100,139 @@ hex  rom-pa fffc7 + 4 \$number drop  h# 2e19 < [if]
 
 set-bootpath-dev
 " $args" to boot-file
-" \${BOOTPATHDEV}$xosyspath\initrd0.img" expand$ to ramdisk
-" \${BOOTPATHDEV}$xosyspath\vmlinuz0" expand$ to boot-device
+" \${BOOTPATHDEV}$xosyspath\initrd.img" expand$ to ramdisk
+" \${BOOTPATHDEV}$xosyspath\vmlinuz" expand$ to boot-device
 unfreeze
 boot
 EOF
 
 fi
 
-BOOTPATH=$SYSLINUXPATH
-[[ -n $multi ]] && BOOTPATH=syslinux
+if [[ $SLNX_CFG ]]; then
+    BOOTPATH=$SYSLINUXPATH
+    [[ $multi ]] && BOOTPATH=syslinux
+        # multi image SYSLINUX boots chain load from the root installation.
 
-# This is a bit of a kludge, but syslinux doesn't guarantee the API
-# for its com32 modules, :/, so we use the version on the installation host,
-# selecting the UI present on the source. (This means that for multi boot
-# installations, the most recent host and source may alter the version and UI.)
-# See https://bugzilla.redhat.com/show_bug.cgi?id=492370
-for f in vesamenu.c32 menu.c32; do
-    if [[ -f $TGTMNT/$SYSLINUXPATH/$f ]]; then
-        UI=$f
-        for d in /usr/share/syslinux /usr/lib/syslinux; do
-            if [[ -f $d/$f ]]; then
-                cp -p $d/$f $TGTMNT/$BOOTPATH/$f >/dev/null 2>&1 || :
-                break 2
-            fi
-        done
-    fi
-done
+    # This is a bit of a kludge, but syslinux doesn't guarantee the API
+    # for its com32 modules, :/, so we use the version on the installation host,
+    # selecting the UI present on the source. (This means that for multi boot
+    # installations, the most recent host and source may alter the version and UI.)
+    # See https://bugzilla.redhat.com/show_bug.cgi?id=492370
+    for f in vesamenu.c32 menu.c32; do
+        if [[ -f $TGTMNT$SYSLINUXPATH/$f ]]; then
+            UI=$f
+            for d in /usr/share/syslinux /usr/lib/syslinux; do
+                if [[ -f $d/$f ]]; then
+                    cp -up $d/$f $TGTMNT$BOOTPATH/$f >/dev/null 2>&1 || :
+                    break 2
+                fi
+            done
+        fi
+    done
 
-if [[ $multi == $LIVEOS ]] && [[ $_1stindir != $LIVEOS ]]; then
-    # We need to do some more config file tweaks for multi-image mode.
-    sed -i -r "s;\s+[^ ]*menu\.c32\>; $UI;g
-               s;kernel\s+vm;kernel /$_LIVEOS/syslinux/vm;
-               s;initrd=i;initrd=/$_LIVEOS/syslinux/i;
-              " $TGTMNT/$SYSLINUXPATH/isolinux.cfg
-    sed -i -r "/^\s*label\s+$_LIVEOS\>/I { N;N;N;N; d }
-               0,/^\s*label\s+.*/I {
-               /^\s*label\s+.*/I i\
-               label $LIVEOS\\
-\  menu label ^Go to $LIVEOS ~$TITLE menu\\
-\  kernel $UI\\
-\  APPEND /$LIVEOS/syslinux/$CONFIG_FILE\\
+    if [[ $multi == $LIVEOS ]] && [[ $_1stindir != $LIVEOS ]]; then
+        # We need to do some more config file tweaks for multi-image mode.
+        sed -i -r "s;\s+[^ ]*menu\.c32\>; $UI;g
+                   s;kernel\s+vm;kernel \/$_LIVEOS\/syslinux\/vm;
+                   s;initrd=i;initrd=\/$_LIVEOS\/syslinux\/i;
+                  " $TGTMNT$SYSLINUXPATH/isolinux.cfg
+        sed -i -r "/^\s*label\s+$_LIVEOS\>/I { N;N;N;N; d }
+                   0,/^\s*label\s+.*/I {
+                   /^\s*label\s+.*/I i\
+                   label $LIVEOS\\
+    \  menu label ^Go to $LIVEOS ~$TITLE menu\\
+    \  kernel $UI\\
+    \  APPEND /$LIVEOS/syslinux/$CONFIG_FILE\\
 
-               }" $TGTMNT/syslinux/$CONFIG_FILE
+                   }" $TGTMNT/syslinux/$CONFIG_FILE
 
-    cat << EOF >> $TGTMNT/$SYSLINUXPATH/isolinux.cfg
+        cat <<'EOF' >> $TGTMNT$SYSLINUXPATH/isolinux.cfg
 menu separator
 LABEL multimain
   MENU LABEL Return to Multi Live Image Boot Menu
   KERNEL $UI
   APPEND ~
 EOF
-_LIVEOS=*$_LIVEOS
+    _LIVEOS=\*$_LIVEOS
+    fi
 fi
 
-# Remove duplicated entries (mid/end line) and double whitespace after words.
-sed  -i -r '/^\s*append|linuxefi/I {
-            :w;s/(\s+\S+)\s*(.*)\1(\s+|$)/\1 \2\3/g;tw
+# Remove repeated empty lines, duplicated entries (mid/end line),
+#  and double whitespace after words.
+sed -i -r  'N;/^\n$/D;P;D;' $SLNX_CFG $GRUB_CFG
+sed -i -r  '/^\s*append|linux/I {
+            /$/ s// /
+            :w s/(\s(\S+)\s.*)\2\s/\1/;tw
             s/\>\s\s+/ /g
-            s/\s+$//}' $BOOTCONFIG $BOOTCONFIG_EFI
+            s/\s+$//}
+            ' $SLNX_CFG $GRUB_CFG
 
-mv $TGTMNT/$SYSLINUXPATH/isolinux.cfg $TGTMNT/$SYSLINUXPATH/$CONFIG_FILE
+if [[ $SLNX_CFG ]]; then
+    mv $TGTMNT$SYSLINUXPATH/isolinux.cfg $TGTMNT$SYSLINUXPATH/$CONFIG_FILE
 
-if [[ -n $MENUS ]]; then
-    sed -i -r "/^\s*label\s+linux/I i\
-    $MENUS
-    " $TGTMNT/$SYSLINUXPATH/$CONFIG_FILE
+    if [[ $MENUS ]]; then
+        sed -i -r "/^\s*label\s+linux/I i\
+        $MENUS
+        " $TGTMNT$SYSLINUXPATH/$CONFIG_FILE
+    fi
+    [[ $multi || $multidirs ]] &&
+      sed -i -r "1,20 s/^\s*(menu\s+title)\s+.*/\1 Multi Live Image Boot Menu/I
+                " $TGTMNT/syslinux/$CONFIG_FILE
+
+    sed -i -r "s/\s+[^ ]*menu\.c32\>/ $UI/g" $TGTMNT$SYSLINUXPATH/$CONFIG_FILE
 fi
-[[ -n $multi || -n $multidirs ]] &&
-    sed -i -r "1,20 s/^\s*(menu\s+title)\s+.*/\1 Multi Live Image Boot Menu/I
-              " $TGTMNT/syslinux/$CONFIG_FILE
 
-sed -i -r "s/\s+[^ ]*menu\.c32\>/ $UI/g" $TGTMNT/$SYSLINUXPATH/$CONFIG_FILE
-
-if [[ -f $BOOTCONFIG_EFI.multi ]]; then
+if [[ -f $GRUB_CFG.multi ]]; then
     # (Implies --multi and the presence of EFI components.)
-    # Insert marker and delete any menu entries with conflicting paths.
+    # Insert ..., null line, & delete any menu entries with conflicting paths--
+    #   (same TGTUUID and _BOOTPATH).
     sed -i -r "1 i\
 ...
-               /^\s*menuentry\s+.*/ {N;N;N;N;N;N;N;N;N;N;N;N;N
-               \,\s+\/$_SYSLINUXPATH, d }" $BOOTCONFIG_EFI.multi
+               /### BEGIN/,$ {/^}$/ a
+
+}" $GRUB_CFG.multi
+    sed -i -r "/./ {H;$!d};x
+    s/.*search[^\n]+$TGTUUID[^\n]*\n[^\n]+\s+$_BOOTPATH.*//" $GRUB_CFG.multi
     # Append other pre-existing menus.
-    cat $BOOTCONFIG_EFI.multi >> $BOOTCONFIG_EFI
-    # Clear header that came from $BOOTCONFIG_EFI.multi.
+    cat $GRUB_CFG.multi >> $GRUB_CFG
+    # Clear header & nulls that came from $GRUB_CFG.multi.
     sed -i -r '/^\.\.\.$/,/^\s*menuentry\s+/ {
-               /^\s*menuentry\s+/ ! d}' $BOOTCONFIG_EFI
-    rm $BOOTCONFIG_EFI.multi
+               /^\s*menuentry\s+/ ! d}
+               /### BEGIN/,$ {
+               /^$/ d}' $GRUB_CFG
+    rm $GRUB_CFG.multi
+fi
+if [[ $uuids ]] && [[ ! -f $TGTMNT/boot/grub2/grub.cfg ]]; then
+    # $uuids implies previous installations on the disk.
+    mkdir -m 0755 -p $TGTMNT/boot/grub2
+    cp -a $GRUB_CFG $TGTMNT/boot/grub2/grub.cfg
+fi
+if [[ -f $TGTMNT/boot/grub2/grub.cfg ]]; then
+    sed -i -r 's;syslinux;images\/pxeboot;' $GRUB_CFG
+    cp -a $TGTMNT/boot/grub2/grub.cfg $TGTMNT/boot/grub2/grub.cfg.prev
+    cp -a $GRUB_CFG $TGTMNT/boot/grub2/grub.cfg
+    sed -i -r "/^\s+insmod\s+(efi_gop|efi_uga|video_bochs|video_cirrus)/ d
+               /^\s*insmod\s+part_/ a insmod chain
+               s/linuxefi/linux/
+               s/initrdefi/initrd/" $TGTMNT/boot/grub2/grub.cfg
+#               $,/^}$/ d 
+fi
+sed -n -r "/^\s+menuentry\s+'Boot\s+first\s+drive'/,$ {
+           s/^\t// p}" \
+           $TGTMNT/boot/grub2/grub.cfg.prev >> $TGTMNT/boot/grub2/grub.cfg
+
+if [[ $uuids ]]; then
+    # Propagate grub.cfg to sister partitions with live images.
+    TGTDIR=$(mktemp -d /tmp/tgtdir.XXXXX)
+    for u in $uuids; do
+        mount UUID=$u $TGTDIR
+        cp -a $TGTDIR$EFI_BOOT/grub.cfg $TGTDIR$EFI_BOOT/grub.cfg.prev
+        cp -a $TGTDIR/boot/grub2/grub.cfg $TGTDIR/boot/grub2/grub.cfg.prev
+        cp -a $GRUB_CFG $TGTDIR$EFI_BOOT/grub.cfg
+        cp -a $TGTMNT/boot/grub2/grub.cfg $TGTDIR/boot/grub2/grub.cfg
+        umount $TGTDIR
+    done
+    rmdir $TGTDIR
 fi
 
 # Always make the following adjustments.
@@ -3357,20 +4241,21 @@ if [[ -f $TGTMNT$T_EFI_BOOT/BOOT.conf ]]; then
     if [[ -f $TGTMNT$T_EFI_BOOT/BOOTia32.conf ]]; then
         # replace the ia32 hack. BOOTia32.conf was in Fedora 11-14.
         cp -f $TGTMNT$T_EFI_BOOT/BOOTia32.conf $TGTMNT$T_EFI_BOOT/BOOT.conf
-    elif [[ $BOOTCONFIG_EFI -ef $TGTMNT$T_EFI_BOOT/BOOT.conf ]]; then
-        cp -f $BOOTCONFIG_EFI $TGTMNT$T_EFI_BOOT/grub.cfg
+    elif [[ $GRUB_CFG -ef $TGTMNT$T_EFI_BOOT/BOOT.conf ]]; then
+        cp -f $GRUB_CFG $TGTMNT$T_EFI_BOOT/grub.cfg
     else
         # Fedora 27+ duplicates /EFI/BOOT/grub.cfg at /EFI/BOOT/BOOT.conf
-        cp -f $BOOTCONFIG_EFI $TGTMNT$T_EFI_BOOT/BOOT.conf
+        cp -f $GRUB_CFG $TGTMNT$T_EFI_BOOT/BOOT.conf
     fi
 fi
 
+if [[ $SLNX_CFG ]]; then
 # syslinux >= 6.02 also requires ldlinux.c32, libcom32.c32, libutil.c32
 # Since the version of syslinux being used is the one on the host, they may
 # not be available on the source, so copy them from the host, when available.
 for f in ldlinux.c32 libcom32.c32 libutil.c32; do
     if [[ -f /usr/share/syslinux/$f ]]; then
-        cp -p /usr/share/syslinux/$f $TGTMNT/$BOOTPATH/$f >/dev/null 2>&1 || :
+        cp -up /usr/share/syslinux/$f $TGTMNT/$BOOTPATH/$f >/dev/null 2>&1 || :
     elif [[ $syslinuxboot == missing ]]; then
         break
     else
@@ -3381,162 +4266,224 @@ for f in ldlinux.c32 libcom32.c32 libutil.c32; do
         read
     fi
 done
+fi
 
-if [[ -n $BOOTCONFIG_EFI ]]; then
-    if [[ $(lsblk -no PARTTYPE $p2 2>/dev/null) == \
-        @(c12a7328-f81f-11d2-ba4b-00a0c93ec93b|0xef) ]]; then
-        d=$(mktemp -d)
-        mount $p2 $d
-        if ! [[ $nouefi ]] && [[ $TGTFS == f2fs ]] && [[ $xa ]]; then
-            # Build a UEFI executable for use as an EFI Boot Stub.
-            if ! [[ $flat_squashfs ]]; then
-                mount -r "$SRCIMG" $IMGMNT || exitclean
-            fi
-            mount -r $RFSIMG $IMGMNT || exitclean
-            f="dracut $d/linux_$LIVEOS.efi  --uefi --kmoddir \
-            $IMGMNT/usr/lib/modules/$kver --kver $kver --no-machineid \
-            --kernel-image $CONFIG_SRC/vmlinuz* --no-hostonly \
-            --add dmsquash-live --add-drivers f2fs"
-            p=''
-            [[ $overlay == none ]] && p=rd.live.overlay=none
-            [[ $overlaysizeb ]] || [[ x${overlayfs#temp} != x ]] &&
-                p+="rd.live.overlay=$TGTLABEL"
-            [[ $overlayfs ]] && p+=' rd.live.overlay.overlayfs'
-            [[ ${_LIVEOS:0:1} == \* ]] && p+=" rd.live.dir=$LIVEOS"
-            [[ $kernelargs ]] && p+=" $kernelargs"
-            f=$(sed 's/ \+/ /g' <<< $f)
-            printf "
-       \rPlease wait...  Building a UEFI executable for use as an EFI Boot Stub
-       \rwith the following dracut command:\n
-       \r$f --kernel-cmdline \"root=live:$TGTLABEL rd.live.image rw $p\"\n\n"
-      efi=$($f --kernel-cmdline "root=live:$TGTLABEL rd.live.image rw $p" 2>&1)
-            # 'Silence is golden' here.
-            [[ $efi ]] && printf "\nNOTICE:  $efi\n\n" && cleansrc && exitclean
-            p=$srcdev
-            [[ $SRCFS == iso9660 ]] && p=$(findmnt -no SOURCE $SRCMNT)
-            efi=$label-$LIVEOS-$(blkid -s LABEL -o value $p)
-            f="efibootmgr --create --disk $device --part 2 \
---loader \\linux_$LIVEOS.efi \\
+if [[ $TGTFS == f2fs ]]; then
+    # Allow for multiple initrd images; use first in array.
+    if [[ $LIVEOS == $_1stindir ]]; then
+        i=($TGTMNT/images/pxeboot/initrd*.img)
+    else
+        i=($TGTMNT${multidirs:+/$LIVEOS}/images/pxeboot/initrd*.img)
+    fi
+    [[ -e /tmp/~i ]] && rm -- /tmp/~i
+    lsinitrd $i usr/lib/modules/*/kernel/fs/f2fs/* > /tmp/~i
+    # If initrd lacks f2fs driver, signal for a rebuild.
+    [[ -s /tmp/~i ]] || xa+=@
+    rm -- /tmp/~i
+fi
+
+if [[ $GRUB_CFG ]]; then
+    if [[ $esp ]]; then
+        ESPMNT=$(mktemp -d /tmp/espmnt.XXXX)
+        mount $esp $ESPMNT
+    fi
+elif [[ $SLNX_CFG ]]; then
+    i=("$TGTMNT/$SYSLINUXPATH/initrd*.img")
+fi
+
+[[ ! $nouefi ]] && [[ $TGTFS == f2fs ]] && [[ ${xa%@} ]] && { xa=uefi &&
+    i="$ESPMNT/linux_$LIVEOS.efi --uefi" ;}
+
+if [[ $clone ]] || [[ $xa == @(uefi|@) ]]; then
+    # Rebuild initrd, or
+    # build a UEFI executable for use as an EFI Boot Stub.
+    if ! { [[ $flat_srcimg ]] || [[ $unsqfs ]] || [[ $clone ]] ;}; then
+        mount -r "$SRCIMG" $IMGMNT || exitclean
+    fi
+    if [[ $clone ]]; then
+        k="/usr/lib/modules/$kver/vmlinuz*"
+        z=${k%/*}
+    else
+        mount -r $RFSIMG $IMGMNT || exitclean
+        k="$TGTMNT${multidirs:+/$LIVEOS}/images/pxeboot/vmlinuz*"
+    fi
+    # Allow for multiple initrd images; use first in array.
+    i=($TGTMNT${multidirs:+/$LIVEOS}/images/pxeboot/initrd*.img)
+    f="$(lsinitrd "$i" -f /usr/lib/dracut/build-parameter.txt) "
+    f=${f//--debug /}; f=${f//--force /}; f=${f//-f /}; f=${f//--kver[= ]+([! ]) /}
+    f=${f//--sysroot[= ]+([! ]) /}; f=${f//--kernel-image[= ]+([! ]) /};
+    f=${f//--tmpdir[= ]+([! ]) /}; f=${f//--fscks[= ]+([! ]) /}; f=${f//-v /}
+    f=${f//--kmoddir[= ]+([! ]) /}
+    f=$(sed -r "s/(--omit|-o|--add|-a) ['\"] ([^'\"]+) ['\"]/\1 '\2'/g" <<< "$f")
+    s=$(sed -n -r "s/.*(--add|-a) ('|\"|).*/\2/p" <<< "$f")
+    [[ $s ]] || s=' '
+    a=$(sed -n -r "s/.*(--add|-a) ('|\"|)([^$s]+).*/\3/p" <<< "$f")
+    a=" ${a:+$a }livenet dmsquash-live dmsquash-live-ntfs convertfs pollcdrom qemu qemu-net "
+    a=$(sed -r ":w s/(\s(\S+)\s.*)\2\s/\1/;tw" <<< "$a")
+    a=${a# }; a=${a% }
+    f=$(sed -r "/ (--add|-a) / s/(.*)(--add|-a) ('|\"|)[^$s]+$s(.*)/\1 --add '$a' \4/
+/ (--add|-a) /! s/$/ --add '$a'/" <<< "$f")
+    # '--sysroot' argument requires dracut version 051 or greater.   --sysroot $IMGMNT --kernel-image '$k' --kmoddir '$z'
+    f="DRACUT_LDD=${IMGMNT}usr/bin/ldd dracut $i $f --kver '$kver' --no-machineid --no-hostonly --no-early-microcode --tmpdir '/tmp' --zstd --force"
+    p=''
+    [[ $nooverlay ]] && p=rd.live.overlay=none
+    [[ $overlaysizeb ]] || [[ x${OverlayFS#temp} != x ]] &&
+        p+=" rd.live.overlay=$_OVLPATH"
+    [[ $OverlayFS ]] && p+=' rd.live.overlay.overlayfs'
+    [[ ${_LIVEOS:0:1} == \* ]] && p+=" rd.live.dir=$LIVEOS"
+    [[ $kernelargs ]] && p+=" $kernelargs"
+    f=$(sed -r ":w s/(\s(\S+)\s.*)\2\s/\1/;tw
+s/\s+/ /g
+s/\s+$//" <<< "$f")
+    if [[ ${xa%@} == uefi ]]; then
+        i='a UEFI executable for use as an EFI Boot Stub'
+        z="--kernel-cmdline \"root=live:$TGTLABEL rd.live.image rw $p\""
+    else           # if [[ $clone ]]; then
+        i='an initial RAM filesystem for booting this image'
+        z=''
+    fi
+    printf "
+Please wait...  Building $i
+with the following dracut command:\n
+$f${z:+ $z}\n\n"
+#    read
+    eval $f\ $z 2>&1
+    if [[ $? != 0 ]]; then
+        printf "\nNOTICE:  Building $i failed.\n\n"
+        [[ $esp ]] && umount $ESPMNT && rmdir $ESPMNT
+        exitclean
+    fi
+    if [[ $xa == uefi ]]; then
+        ppath=$srcdev
+        [[ $SRCFS == iso9660 ]] && ppath=$(findmnt -no SOURCE $SRCMNT)
+        efi=$label-$LIVEOS-$(lsblk -no LABEL $ppath)
+        f="efibootmgr --create --disk $device --part 2 \
+--loader \\linux_$LIVEOS.efi -@ \\linux_$LIVEOS.kcl \\
 --label "
-            y=$(date +%Y)
-            p="
-    NOTICE:
-            Flash-Friendly File System (F2FS) formatted devices with
-            extra_attr or compression fail to boot with
-            year $y versions of SYSLINUX-EXTLINUX or GNU GRUB.
+        y=$(date +%Y)
+        p="
+NOTICE:
+        Flash-Friendly File System (F2FS) formatted devices with
+        extra_attr or compression fail to boot with
+        year $y versions of SYSLINUX-EXTLINUX or GNU GRUB.
 
-            Booting is possible with an EFI Boot Stub loader.\n"
-            if ! [[ $force ]]; then
-                if [[ -d /sys/firmware/efi ]]; then
-                    IFS=: read -r -p "$p
-            If you would like to write the following, new boot entry into
-            your computer system's UEFI Boot Manager, press 'Enter', or
-            first input a substitute for the proposed label:
+        Booting is possible with an EFI Boot Stub loader.\n"
+        if ! [[ $force ]]; then
+            if [[ -d /sys/firmware/efi ]]; then
+                IFS=: read -r -p "$p
+        If you would like to write the following, new boot entry into
+        your computer system's UEFI Boot Manager, press 'Enter', or
+        first input a substitute for the proposed label:
 
 $f$efi
 
-            Or, press the [space bar] + 'Enter' to skip this step.
-            " msg
-                    case $msg in
-                        +(' '))
-                            :
-                            ;;
-                        '')
-                            f+="$efi"
-                            ;&
-                        *)
-                            f+="$msg"
-                            $f
-                    esac
-                    unset -v msg
-                else
-                    msg="$p
-            From a UEFI booted image, the following command would write a
-            new boot entry into the computers's UEFI Boot Manager:
+        Or, press the [space bar] + 'Enter' to skip this step.
+        " msg
+            na='+(' ')'
+                case $msg in
+                    $na)
+                        :
+                        ;;
+                    '')
+                        f+="$efi"
+                        ;&
+                    *)
+                        f+="$msg"
+                        $f
+                esac
+                unset -v 'msg'
+            else
+                msg="$p
+    From a UEFI booted image, the following command would write a
+    new boot entry into the computers's UEFI Boot Manager:
 
 sudo $f$efi\n\n        (You may choose any suitable label.)\n"
-                fi
             fi
-            cleansrc
+        elif [[ $clone ]]; then
+            eval $f 2>&1
+            [[ $SLNX_CFG ]] && cp -at $TGTMNT/$SYSLINUXPATH/ $k &&
+       cp -at $TGTMNT/$multi/images/pxeboot/ "$TGTMNT/$SYSLINUXPATH/initrd.img"
+            cp -at $TGTMNT/$multi/images/pxeboot/ $k
+            efi=''
         fi
-        [[ -f $d$T_EFI_BOOT/grub.cfg ]] &&
-            cp -p $d$T_EFI_BOOT/grub.cfg $TGTMNT$T_EFI_BOOT/grub.cfg.prev
-        cp -a $TGTMNT/EFI $d >/dev/null 2>&1 || :
-
-        if [[ $TGTFS == f2fs ]] && ! [[ $xa ]] && ! [[ $b ]]; then
-            mv $TGTMNT$T_EFI_BOOT/BOOTX64.EFI $TGTMNT$T_EFI_BOOT/BOOTX64.EFI.orig
-            p="grub2-mkimage --format=x86_64-efi --prefix=/EFI/BOOT \
-            --output=$d/EFI/BOOT/BOOTX64.EFI --compression=xz fat ext2 f2fs \
-            iso9660 ls loopback part_gpt part_msdos normal configfile boot \
-            linux reboot search search_label search_fs_uuid gfxterm_background \
-            gfxterm gfxterm_menu all_video video_cirrus video_bochs efi_gop \
-            efi_uga"
-            p=$(sed 's/ \+/ /g' <<< $p)
-            efi=$($p 2>&1)
-            [[ $efi ]] && printf $efi
-            msg="    NOTICE:
-            A GRUB EFI boot binary with F2FS filesystem support for
-            x86_64 architecture systems has been built in the
-            EFI System Partition at the fallback boot loader path
-            <ESP>/EFI/BOOT/BOOTX64.EFI using this command:\n\n$p\n
-            \rOther EFI binaries in /EFI/BOOT lack FSFS support at this time."
-            cp $d/EFI/BOOT/BOOTX64.EFI $TGTMNT$T_EFI_BOOT/BOOTX64.EFI
-        fi
-        umount $d && rmdir $d
-        fsck.fat -avVw $p2 || :
-        echo
-    fi
-    if [[ $(lsblk -no PARTTYPE $p3 2>/dev/null) == \
-        @(48465300-0000-11aa-aa11-00306543ecac|0xaf) ]]; then
-        d=$(mktemp -d)
-        mount -t hfsplus $p3 $d
-        for f in $TGTMNT$T_EFI_BOOT/BOOT.conf $TGTMNT$T_EFI_BOOT/grub.cfg \
-            $TGTMNT$T_EFI_BOOT/BOOTX64.EFI; do
-            [[ -f $f ]] && cp $f $d$T_EFI_BOOT
-        done
-        cp $TGTMNT$T_EFI_BOOT/grub.cfg $d/System/Library/CoreServices
-        [[ -f $BOOTCONFIG_EFI.prev ]] && cp $BOOTCONFIG_EFI.prev $d$T_EFI_BOOT
-        umount $d && rmdir $d
-        fsck.hfsplus -yrdfp $p3
-        echo
+    cleansrc
     fi
 fi
 
-case $TGTFS in
-    vfat|msdos)
-        # syslinux expects the config to be named syslinux.cfg
-        # and has to run with the file system unmounted.
+if [[ $esp ]]; then
+    [[ -f $ESPMNT$T_EFI_BOOT/grub.cfg ]] &&
+        cp -p $ESPMNT$T_EFI_BOOT/grub.cfg $TGTMNT$T_EFI_BOOT/grub.cfg.prev
+    cp -ua $TGTMNT/EFI $ESPMNT >/dev/null 2>&1 || :
 
-        # Deal with mtools complaining about ldlinux.sys
-        if [[ -f $TGTMNT/$BOOTPATH/ldlinux.sys ]]; then
-            rm -f $TGTMNT/$BOOTPATH/ldlinux.sys
-        fi
-        cleanup
-        if [[ -n $BOOTPATH ]]; then
-            # Show error message if syslinux fails.
-            syslinux -d $BOOTPATH $TGTDEV || :
-        elif [[ $syslinuxboot != missing ]]; then
-            syslinux $TGTDEV || :
-        fi
-        ;;
-    ext[432]|btrfs|xfs)
-        # extlinux expects the config to be named extlinux.conf
-        # and has to be run with the file system mounted.
-        if [[ $syslinuxboot != missing ]]; then
-            extlinux -i $TGTMNT/$BOOTPATH || :
-        fi
-        # Starting with syslinux 4, ldlinux.sys is used on all file systems.
-        if [[ -f $TGTMNT/$BOOTPATH/extlinux.sys ]]; then
-            chattr -i $TGTMNT/$BOOTPATH/extlinux.sys
-        elif [[ -f $TGTMNT/$BOOTPATH/ldlinux.sys ]]; then
-            chattr -i $TGTMNT/$BOOTPATH/ldlinux.sys
-        fi
-        ;&
-    f2fs)
-        cleanup
-esac
+    if [[ $TGTFS == f2fs ]] && ! [[ ${xa%@} ]] && ! [[ $b ]]; then
+        mv $TGTMNT$T_EFI_BOOT/BOOTX64.EFI $TGTMNT$T_EFI_BOOT/BOOTX64.EFI.orig
+        p="grub2-mkimage --format=x86_64-efi --prefix=/EFI/BOOT \
+        --output=$d/EFI/BOOT/BOOTX64.EFI --compression=xz fat ext2 f2fs \
+        iso9660 ls loopback part_gpt part_msdos normal configfile boot \
+        linux reboot search search_label search_fs_uuid gfxterm_background \
+        gfxterm gfxterm_menu all_video video_cirrus video_bochs efi_gop \
+        efi_uga"
+        p=$(sed 's/ \+/ /g' <<< $p)
+        efi=$($p 2>&1)
+        [[ $efi ]] && printf $efi
+        msg="    NOTICE:
+        A GRUB EFI boot binary with F2FS filesystem support for
+        x86_64 architecture systems has been built in the
+        EFI System Partition at the fallback boot loader path
+        <ESP>/EFI/BOOT/BOOTX64.EFI using this command:\n\n$p\n
+        \rOther EFI binaries in /EFI/BOOT lack F2FS support at this time."
+        cp $ESPMNT/EFI/BOOT/BOOTX64.EFI $TGTMNT$T_EFI_BOOT/BOOTX64.EFI
+    fi
+    umount $ESPMNT && rmdir $ESPMNT
+    flock $device fsck.fat -avVw $esp || :
+    echo
+fi
 
-[[ -n $multi || -n $multidirs ]] && multi=Multi\ 
+if [[ $SLNX_CFG ]]; then
+    case $TGTFS in
+        vfat|msdos)
+            # syslinux expects the config to be named syslinux.cfg
+            # and has to run with the file system unmounted.
+
+            # Deal with mtools complaining about ldlinux.sys
+            if [[ -f $TGTMNT$BOOTPATH/ldlinux.sys ]]; then
+                rm -f -- $TGTMNT$BOOTPATH/ldlinux.sys
+            fi
+            cleanup
+            if [[ $BOOTPATH ]]; then
+                # Show error message if syslinux fails.
+                syslinux -d $BOOTPATH $TGTPT || :
+            elif [[ $syslinuxboot != missing ]]; then
+                syslinux $TGTPT || :
+            fi
+            # copy boot sector to backup.
+            dd if=$TGTPT of=/tmp/bootrec.dat bs=512 count=1 >/dev/null 2>&1
+            dd if=/tmp/bootrec.dat of=$TGTPT bs=512 seek=6 conv=fsync \
+                                                                >/dev/null 2>&1
+            ;;
+        ext[432]|btrfs|xfs)
+            # extlinux expects the config to be named extlinux.conf
+            # and has to be run with the file system mounted.
+            if [[ $syslinuxboot != missing ]]; then
+                extlinux -i $TGTMNT$BOOTPATH || :
+            fi
+            # Starting with syslinux 4, ldlinux.sys is used on all file systems.
+            if [[ -f $TGTMNT$BOOTPATH/extlinux.sys ]]; then
+                chattr -i $TGTMNT$BOOTPATH/extlinux.sys
+            elif [[ -f $TGTMNT$BOOTPATH/ldlinux.sys ]]; then
+                chattr -i $TGTMNT$BOOTPATH/ldlinux.sys
+            fi
+            ;&
+        f2fs)
+            cleanup
+    esac
+else
+    rm -rf --one-file-system -- $TGTMNT/syslinux \
+        $(ls -1d $TGTMNT/*/syslinux >/dev/null 2>&1 || :) > /dev/null 2>&1 || :
+fi
+[[ $TGTFS == @(vfat|msdos|f2fs) ]] && cleanup
+
+[[ $multi || $multidirs ]] && multi=Multi\ 
 echo -e "\nTarget device is now set up with a ${multi}Live image!\n"
 if [[ $xa == nof2fs.mod && $nouefi ]]; then
     printf 'HOWEVER:  Please note, a boot loader suitable for F2FS is lacking.\n
@@ -3547,7 +4494,24 @@ if [[ $xa == nof2fs.mod && $nouefi ]]; then
     And then rerun this installation with the --reconfig option
     and targeting '\''%s'\''.\n
 See https://fedoraproject.org/wiki/LiveOS_image#Flash-Friendly_File_System_.28F2FS.29
-    for more information.\n\n' $TGTDEV
+    for more information.\n\n' $TGTPT
 fi
-[[ $msg ]] && printf "$msg\n\n" || :
-trap - EXIT
+[[ $msg && $xa == uefi ]] && printf "$msg\n\n" || :
+if [[ $clone == live ]]; then
+    if [[ -h /run/overlayfs ]] || [[ -f $OVLPATH ]]; then
+         msg='and reset the
+    current overlay.  >>Immediate rebooting is recommended.<<\n
+    Due the the abrupt nature of this update, the next boot may experience
+    some unusual events due to lost context, but seems to recover successfully.'
+    else
+        msg='on the next boot.'
+    fi
+    printf "\nA new flattened SquashFS image has been generated from the currently
+    booted root filesystem.\n
+    Press Enter to replace the current read-only base filesystem $msg\n
+    or press Ctrl C to skip these changes.\n"
+    read
+    mv /run/initramfs/live/$LIVEOS/_squashfs.img /run/initramfs/live/$LIVEOS/squashfs.img
+    rm /run/initramfs/live/$LIVEOS/rootfs.img >/dev/null 2>&1 || :
+    resetovl /run/initramfs/live/$LIVEOS/$OVLNAME
+fi
