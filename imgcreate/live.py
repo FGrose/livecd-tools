@@ -184,7 +184,8 @@ class LiveImageCreatorBase(LoopImageCreator):
         squashloop = DiskMount(LoopbackDisk(squashimg, 0), self._mkdtemp(), "squashfs")
 
         # 'self.compress_args is None' will force reading it from base_on.
-        if self.compress_args is None:
+        if (self.compress_args is None and
+            self._LoopImageCreator__fstype == 'squashfs'):
             self.compress_args = squashfs_compression_type(squashimg)
             if self.compress_args == 'undetermined':
                 # Default to 'gzip' for compatibility with older versions.
@@ -259,13 +260,21 @@ class LiveImageCreatorBase(LoopImageCreator):
             logging.error("Missing initial EFI bootloader, skipping efiboot.img creation.")
             return
 
+        e = '/EFI/BOOT'
+        d = self._ImageCreator__builddir
+        cmd = ["mkefiboot", "-l", "ESP", isodir + e, d + "/efiboot.img"]
+
         if self.BIOSbooter == 'SYSLINUX':
             d = isodir + "/images"
-        else:
-            d = self._ImageCreator__builddir
+        elif self.BIOSbooter == 'GRUB-F42+':
+            # Follow Fedora kiwi process.
+            cmd = ['qemu-img', 'create', d + '/efiboot.img', '30M']
+            subprocess.call(cmd)
+            cmd = ['mkdosfs', '-n', 'BOOT', d + '/efiboot.img']
+            subprocess.call(cmd)
+            cmd = ['mcopy', '-Do', '-s', '-n', '-i', d + '/efiboot.img', isodir + '/EFI', '::']
 
-        subprocess.call(["mkefiboot", "-l", "ESP", isodir + "/EFI/BOOT",
-                         d + "/efiboot.img"])
+        subprocess.call(cmd)
 
     def _generate_grub2_bios_bootloader(self, isodir):
         """Generate the eltorito.img for i386 bios booting."""
@@ -277,7 +286,7 @@ class LiveImageCreatorBase(LoopImageCreator):
         """Configure the image so that it's bootable."""
         self._configure_bootloader(self.__ensure_isodir())
         self._generate_efiboot(self.__ensure_isodir())
-        if self.BIOSbooter == 'GRUB':
+        if self.BIOSbooter == 'GRUB-F37-41':
             self._generate_grub2_bios_bootloader(self.__ensure_isodir())
 
     def _get_post_scripts_env(self, in_chroot):
@@ -289,7 +298,7 @@ class LiveImageCreatorBase(LoopImageCreator):
         return env
 
     def __extra_filesystems(self):
-        return "vfat msdos isofs ext4 xfs btrfs f2fs squashfs";
+        return "vfat msdos isofs ext4 xfs btrfs f2fs squashfs erofs";
 
     def __extra_drivers(self):
         retval = "sr_mod sd_mod cdrom "
@@ -309,7 +318,7 @@ class LiveImageCreatorBase(LoopImageCreator):
                     retval = retval + module + " "
         return retval
 
-    def __restore_file(self,path):
+    def __restore_file(self, path):
         try:
             os.unlink(path)
         except:
@@ -333,10 +342,13 @@ class LiveImageCreatorBase(LoopImageCreator):
 mdadmconf=no
 lvmconf=no
 compress=""" + self.compress_args + """
-add_dracutmodules+=" livenet dmsquash-live dmsquash-live-autooverlay \
-dmsquash-live-ntfs overlayfs convertfs pollcdrom qemu qemu-net "
+add_dracutmodules+=" dmsquash-live bash "
+omit_dracutmodules+=" dmsquash-live-autooverlay dmsquash-live-ntfs network \
+network-manager livenet qemu-net lvm dmraid mdraid systemd \
+systemd-ask-password systemd-initrd systemd-sysusers dracut-systemd plymouth "
 hostonly=no
 early_microcode=no
+dracut_rescue_image=no
 """ + args[1:]
         args += '\nfilesystems+=" ' + self.__extra_filesystems() + ' "\n'
         if self.__extra_drivers():
@@ -376,20 +388,35 @@ early_microcode=no
                 else:
                     yield entry.stat().st_size
 
-        args = ["xorrisofs"]
-
         if max(iterate_files_recursively(isodir)) >= 4 * 1024**3:
-            args += ["-iso-level", "3"]
+            args = ["-iso-level", "3"]
+        else:
+            args = []
 
-        args += ["-output", iso, "-rational-rock", "-joliet",
-                 "-volid", self.fslabel, "-no-emul-boot"]
+        if self.BIOSbooter == 'GRUB-F42+':
+            # Follow Fedora kiwi process:
+            args = ["xorriso"] + args
+            args += ["-application_id", self.product, "-publisher", self.builder,
+            "-preparer_id", 'livecd-tools - https://github.com/livecd-tools/livecd-tools',
+            "-volid", self.fslabel, "-joliet", "on", "-padding", "0",
+            "-compliance", "no_emul_toc", "-outdev", iso, "-map", isodir, "/",
+            "-chmod", "0755", "/", "--"]
+        else:
+            args = ["xorrisofs"] + args
+            args += ["-output", iso, "-rational-rock", "-joliet",
+                     "-volid", self.fslabel, "-no-emul-boot"]
 
         args.extend(self._get_xorrisofs_options(isodir))
 
-        args.append(isodir)
+        if not self.BIOSbooter == 'GRUB-F42+':
+            args.append(isodir)
 
         if subprocess.call(args) != 0:
             raise CreatorError("ISO creation failed!")
+
+        if self.BIOSbooter == 'GRUB-F42+':
+            args = ["xorriso", "-indev", iso, "-report_system_area", "plain"]
+            subprocess.call(args)
 
         self.__implant_md5sum(iso)
 
@@ -411,8 +438,9 @@ early_microcode=no
         try:
             makedirs(self.__ensure_isodir() + "/LiveOS")
 
-            self._resparse()
-            self._LoopImageCreator__instloop.cleanup()
+            if self._LoopImageCreator__instloop:
+                self._resparse()
+                self._LoopImageCreator__instloop.cleanup()
 
             os_image = os.path.join('LiveOS', 'rootfs.img')
             if self.skip_compression:
@@ -421,7 +449,8 @@ early_microcode=no
             else:
                 if 'flatten-squashfs' in ops:
                     ops.remove('flatten-squashfs')
-                    self._LoopImageCreator__instloop.mount('ro')
+                    if self._LoopImageCreator__instloop:
+                        self._LoopImageCreator__instloop.mount('ro')
                     os_image = self._instroot
                 else:
                     makedirs(os.path.join(
@@ -430,11 +459,23 @@ early_microcode=no
                                        os.path.dirname(self._image), os_image)
                     shutil.move(self._image, os_image)
                     os_image = os.path.dirname(self._image)
-                mksquashfs(os_image,
-                           self.__isodir + "/LiveOS/squashfs.img",
-                           self.compress_args, ops)
-                self._LoopImageCreator__instloop.cleanup()
-                if self.docleanup:
+
+                if 'EROFS' in ops:
+                    # Remove residual /run/, if present from source.
+                    shutil.rmtree(os.path.join(os_image, 'run'), ignore_errors = True)
+                    makedirs(os.path.join(os_image, 'run'))
+                    shutil.rmtree(os.path.join(os_image, 'dev'), ignore_errors = True)
+                    makedirs(os.path.join(os_image, 'dev'))
+                    mkerofs(os_image,
+                            self.__isodir + "/LiveOS/squashfs.img",
+                            self.compress_args, ops)
+                else:
+                    mksquashfs(os_image,
+                               self.__isodir + "/LiveOS/squashfs.img",
+                               self.compress_args, ops)
+                if self._LoopImageCreator__instloop:
+                    self._LoopImageCreator__instloop.cleanup()
+                if self.docleanup and not self.flatten_squashfs:
                     if os_image == self._instroot:
                         os.remove(self._image)
                     else:
@@ -453,7 +494,20 @@ class x86LiveImageCreator(LiveImageCreatorBase):
         self._efiarch = None
 
     def _get_xorrisofs_options(self, isodir):
-        if self.BIOSbooter == 'GRUB':
+        if self.BIOSbooter == 'GRUB-F42+':
+            options = ["-boot_image", "grub", "bin_path=boot/x86_64/loader/eltorito.img",
+            "-boot_image", "grub", "grub2_mbr=" + isodir + "/boot/x86_64/loader/boot_hybrid.img",
+            "-boot_image", "grub", "grub2_boot_info=on", "-boot_image", "any",
+            "partition_offset=16", "-boot_image", "any", "cat_path=boot/x86_64/boot.catalog",
+            "-boot_image", "any", "cat_hidden=on", "-boot_image", "any", "boot_info_table=on",
+            "-boot_image", "any", "platform_id=0x00", "-boot_image", "any", "emul_type=no_emulation",
+            "-boot_image", "any", "load_size=2048", "-boot_image", "any", "appended_part_as=gpt",
+            "-append_partition", "2", "0xef", isodir + "/../efiboot.img",
+            "-boot_image", "any", "next", "-boot_image", "any",
+            "efi_path=--interval:appended_partition_2:all::",
+            "-boot_image", "any", "platform_id=0xef",
+            "-boot_image", "any", "emul_type=no_emulation"]
+        elif self.BIOSbooter == 'GRUB-F37-41':
             options = ["--grub2-mbr", isodir + "/boot/grub2/i386-pc/boot_hybrid.img",
             "-partition_offset", "16", "-appended_part_as_gpt",
             "-append_partition", "2", "C12A7328-F81F-11D2-BA4B-00A0C93EC93B",

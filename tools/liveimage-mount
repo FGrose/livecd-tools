@@ -6,7 +6,7 @@
 #
 # Copyright 2011, Red Hat, Inc.
 # Copyright 2016, Neal Gompa
-# Copyright 2017-2023, Sugar Labs®
+# Copyright 2017-2025, Sugar Labs®
 #   Code for Live mounting an attached LiveOS device added by Frederick Grose,
 #   <fgrose at sugarlabs.org>
 #   Ported to Python 3 by Neal Gompa <ngompa13 at gmail.com>
@@ -198,11 +198,10 @@ def mount(userargs, ops=None):
     args = ['mount'] + userargs
     if ops:
         ops = ops.split()
-        for i in ops:
-            args.insert(1, i)
+        args[1:1] = ops
     rc = call(args)
     if rc != 0:
-        raise LiveImageMountError('Return code: %s\n\n**Check for a message '
+        raise LiveImageMountError('Return code: %s\n\n**Check for a message ' \
               'above the Traceback.**\nFailed mount command:\n%s' % (rc, args))
 
 def loop_setup(path, ops=None):
@@ -406,6 +405,8 @@ def main():
         call(['sync'])
         if os.path.ismount(destmnt):
             call(['umount', '-Rd', destmnt])
+        if aovl_mp:
+            call(['umount', aovl_mp])
         if base_mp:
             call(['umount', '-d', base_mp])
             if ovl_mp:
@@ -422,6 +423,8 @@ def main():
         if not overlayfs:
             if os.path.exists(os.path.join('/dev', 'mapper', 'live-rw' + X)):
                 dmsetup('remove --deferred --retry live-rw' + X)
+            if os.path.exists(os.path.join('/dev', 'mapper', 'live-base' + X)):
+                dmsetup('remove --deferred --retry live-base' + X)
             loop_detach(tmpoverlayloop)
             if os.path.exists(os.path.join('/dev', 'mapper', 'live-ro' + X)):
                 dmsetup('remove --deferred --retry live-ro' + X)
@@ -462,6 +465,7 @@ def main():
     imgloop = ''
     base_mp = ''
     robase_mp = ''
+    aovl_mp = ''
     tmpovl = ''
     workdir = ''
     overlayloop = ''
@@ -565,7 +569,9 @@ def main():
         os.rmdir(liveosmnt)
         # liveosmnt here is a temporary path placeholder for finding liveosdir.
         liveosmnt = liveos
-    elif lsblk('-ndo TYPE', liveos) == 'part':
+    elif stat.S_ISBLK(mode):
+        disk = lsblk('-ndpo PKNAME', liveos)
+        partitions = lsblk('-nrpo TYPE,LABEL,KNAME', disk)
         src = findmnt('-nfro TARGET', liveos)
         if src:
             os.rmdir(liveosmnt)
@@ -581,6 +587,8 @@ def main():
               file=sys.stderr)
         [os.rmdir(mp) for mp in remove_mp]
         sys_exit(1)
+    if lsblk('-ndo FSTYPE', liveos) == 'iso9660':
+        roflag = '-r'
 
     if roflag:
         ops = '-r'
@@ -633,8 +641,8 @@ def main():
                 if os.path.exists(rootfs_img):
                     break
                 else:
-                    # Test for flattend squashfs.img.
-                    rootfs_img = os.path.join(squashmnt, 'proc')
+                    # Test for flattened squashfs.img.
+                    rootfs_img = os.path.join(squashmnt, 'bin')
                     if os.path.isdir(rootfs_img):
                         rootfs_img = squash_img
                         base_mp = squashmnt
@@ -654,9 +662,26 @@ def main():
                 if f.find('overlay-') == 0:
                     overlay = os.path.join(liveosdir, f)
                     break
+        livedir = os.path.basename(liveosdir)
+        if stat.S_ISBLK(mode) and livedir + '_persist' in partitions:
+            # Retrieve first match:
+            autooverlay=partitions.partition(livedir + '_persist')[2].partition('\n')[0].strip()
+            if disk in autooverlay:
+                aovl_mp = tempfile.mkdtemp(prefix=Y + '-aovl-')
+                remove_mp.append(aovl_mp)
+                if ' compression' in rcall(['dump.f2fs', autooverlay])[0]:
+                    ops='-o compress_algorithm=zstd:6,compress_chksum,atgc,gc_merge,lazytime'
+                mount([autooverlay, aovl_mp], ops)
+                aovl_dir = os.path.join(aovl_mp, livedir)
+                for f in os.listdir(aovl_dir):
+                    if f.find('overlay-') == 0:
+                        overlay = os.path.join(aovl_dir, f)
+                        break
         if overlay:
             if not os.access(overlay, os.W_OK):
                 roflag = '-r'
+            else:
+                roflag = ''
             if os.path.isdir(overlay):
                 overlayfs = overlay
                 src = findmnt('-no FSTYPE -T', overlay)
@@ -675,7 +700,6 @@ def main():
                     ovl_mp = tempfile.mkdtemp(prefix=Y + '-ovl-')
                     remove_mp.append(ovl_mp)
                     overlayfs = os.path.join(ovl_mp, 'overlayfs')
-            ops = '-r'
         elif rootfs_img == squash_img:
             overlayfs = tempfile.mkdtemp(prefix=Y + '-tmpovl-')
             remove_dir.append(overlayfs)
@@ -707,7 +731,7 @@ def main():
                 o = 'lowerdir=' + base_mp
             o += ',upperdir=' + overlayfs + ',workdir=' + workdir
             mount(['-t', 'overlay', 'LiveOS_rootfs', '-o', o, destmnt])
-        else:
+        elif os.path.isfile(rootfs_img):
             imgloop = loop_setup(rootfs_img, ops)
             imgsize = rcall(['blockdev', '--getsz', imgloop])[0].rstrip()
             dm_path = os.path.join('/dev', 'mapper', 'live-rw')
@@ -716,7 +740,7 @@ def main():
                 X = tempfile.NamedTemporaryFile(prefix='live-rw.',
                                                 dir='/dev/mapper').name
                 X = os.path.basename(X)[7:]
-            dm_path = os.path.join('/dev', 'mapper', 'live-rw' + X)
+                dm_path = os.path.join('/dev', 'mapper', 'live-rw' + X)
 
             persistent = 'PO'
             if roflag or (not overlayloop and ops):
@@ -737,13 +761,19 @@ def main():
                 dmsetup('create ' + dm_id, ['--table=0 %s linear %s 0' %
                                             (imgsize, imgloop)])
             else:
+                dmsetup('create live-base' + X, ['--table=0 %s linear %s 0' %
+                                            (imgsize, imgloop)])
                 dmsetup('create ' + dm_id, ['--table=0 %s snapshot %s %s %s 8'
-                        % (imgsize, imgloop, overlayloop, persistent)])
+                % (imgsize, '/dev/mapper/live-base' + X, overlayloop, persistent)])
             if roflag and overlayloop != tmpoverlayloop:
                 dmsetup('create live-rw' + X,
                         ['--table=0 %s snapshot %s %s N 8' %
                         (imgsize, dm_path, tmpoverlayloop)])
             mount([os.path.join('/dev', 'mapper', 'live-rw' + X), destmnt])
+        else:
+            if ' compression' in rcall(['dump.f2fs', rootfs_img])[0]:
+                ops='-o compress_algorithm=zstd:6,compress_chksum,atgc,gc_merge,lazytime'
+            mount([rootfs_img, destmnt], ops)
 
         d = os.path.join(destmnt, 'dev', 'live-base')
         if os.path.lexists(d):
@@ -828,7 +858,7 @@ def main():
         environ = os.environ.copy()
         if a:
             # This is overridden if PS1 is set in /root/.bashrc.
-            environ['PS1'] = a.encode('utf-8') + b'-[\u@\h \W]\$ '
+            environ['PS1'] = a.encode('utf-8') + b'-[\\u@\\h \\W]\\$ '
 
         if command and persist:
             print('''Starting process with this command line:

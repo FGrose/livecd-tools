@@ -2089,6 +2089,7 @@ to_be_added () {
 # the numeric result of du into the index zero position of var.  The index zero
 # value is the default operative value for the array variable when no other
 # indices are specified.
+#<<<<<<< Updated upstream
     if [[ -n $skipcompress ]] && [[ -s $SRCIMG ]]; then
         if mount -o loop,ro "$SRCIMG" $SRCMNT; then
             if [[ -s $SRCMNT/LiveOS/rootfs.img ]]; then
@@ -2110,6 +2111,34 @@ to_be_added () {
             to the target device."
             skipcompress=""
         fi
+#=======
+#    declare -ng rfs_v
+#    case $rfs_call in
+#        compress|embedded-fsimg|flat-sqfsimg)
+##            rfs_v=mksqfs
+#            f=mksqfs
+#            ;;
+#        mksqfs)
+##            rfs_v=mksqfs
+#            f=mksqfs
+#            ;;
+#        ''|clone)
+#            rfs_v=unsqfs
+#            tsc=$ssc
+#            ;;
+#        *)
+#            rfs_v=unsqfs
+#            f=unsqfs
+#    esac
+    [[ $tsc$rfs_call == @(''|clone) ]] && tsc=$ssc
+#    echo $ssc$tsc
+        # ssc is source structure code, tsc is target structure code
+        # P=Partition E=Embedded X=eXpanded F=Flattened S=SqFS-partition
+#    k=$rfs_sz
+#    if [[ $rfs_v${rfs_v[1]} == @(''|$IMGFS) ]] && [[ $ssc$tsc == @(XX|EE) ]]; then
+#        rfs_sz=($(du -b $SRCIMG))
+#        f=$ssc$tsc  # flag condition
+#>>>>>>> Stashed changes
     else
         livesize=($(du -b "$SRCIMG"))
     fi

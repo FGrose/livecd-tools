@@ -284,7 +284,7 @@ def main():
     if options.syslinux:
         creator.BIOSbooter = 'SYSLINUX'
     else:
-        creator.BIOSbooter = 'GRUB'
+        creator.BIOSbooter = 'GRUB-F42+'
 
     creator.dracut_conf_args = options.dracut_conf_args
     creator.flat_squashfs = options.flat_squashfs
