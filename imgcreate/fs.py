@@ -1077,6 +1077,20 @@ class BindChrootMount():
 
         self.mounted = True
 
+    def is_mount(self, path):
+        """Use `findmnt -o PROPAGATION path` to look for `shared`. This is more
+        reliable on GNU/Linux for finding bind mounts over os.path.ismount().
+        """
+        try:
+            output = subprocess.check_output(
+                ['findmnt', '-o', 'PROPAGATION', path], text=True)
+            # Look for 'shared' or 'bind' propagation flags, which are common
+            # with bind mounts. This is a simplification; more robust parsing
+            # might be needed for complex cases.
+            return 'shared' in output or 'bind' in output
+        except subprocess.CalledProcessError:
+            return False
+
     def remount(self, ops):
         if not self.mounted:
             self.mounted = False
@@ -1090,7 +1104,7 @@ class BindChrootMount():
                              (remount_ops, self.src, self.dest))
 
     def unmount(self):
-        if not os.path.ismount(self.dest):
+        if not self.is_mount(self.dest):
             self.mounted = False
             return
 
